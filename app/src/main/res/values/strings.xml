@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SHADOWit</string>
+    <string name="tagline">Ultimate Sentence Repeater</string>
+    <string name="from_label">from</string>
+    <string name="from_name">RAJ</string>
+    <string name="shortcut_perm">Permissions</string>
+    <string name="a11y_label">SHADOWit</string>
+    <string name="a11y_desc">Lets SHADOWit use accessibility features in the future.</string>
+</resources>
