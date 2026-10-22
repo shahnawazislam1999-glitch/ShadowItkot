@@ -7,4 +7,6 @@
     <string name="shortcut_perm">Permissions</string>
     <string name="channel_playback">Playback</string>
     <string name="notif_open">Tap to open</string>
+    <!-- kept only so an old leftover res/xml/accessibility_config.xml cannot break the build -->
+    <string name="a11y_desc">Not used.</string>
 </resources>
