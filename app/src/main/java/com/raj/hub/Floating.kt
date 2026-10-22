@@ -24,6 +24,7 @@ import android.widget.Toast
 /**
  * Tiny floating subtitle window (needs "Display over other apps").
  * Shows only the current subtitle with previous / play-pause / next. Fully visible. Tap the text to copy the subtitle.
+ * Double-tap the text to hide that sentence in the app and jump straight to the next one.
  * Drag it by the text to move it; the position is remembered.
  */
 class FloatingSubtitle(private val ctx: Context, private val onCmd: (String) -> Unit) {
@@ -34,6 +35,9 @@ class FloatingSubtitle(private val ctx: Context, private val onCmd: (String) -> 
 
         /** How visible it gets for a moment when you touch it, so you can see what you tap. */
         const val TOUCH_ALPHA = 1.0f
+
+        /** Two taps on the text within this many ms count as a double tap (hide sentence). */
+        const val DOUBLE_TAP_MS = 280L
     }
 
     private val wm = ctx.getSystemService(Context.WINDOW_SERVICE) as WindowManager
@@ -48,6 +52,13 @@ class FloatingSubtitle(private val ctx: Context, private val onCmd: (String) -> 
     private var playing = false
 
     private val dim = Runnable { root?.alpha = IDLE_ALPHA }
+
+    // Single tap = copy, but only after we are sure it is not the first half of a double tap.
+    private val copyRun = Runnable {
+        copyPending = false
+        copyText()
+    }
+    private var copyPending = false
 
     private fun dp(v: Int): Int = (v * ctx.resources.displayMetrics.density).toInt()
 
@@ -68,6 +79,8 @@ class FloatingSubtitle(private val ctx: Context, private val onCmd: (String) -> 
 
     fun hide() {
         main.removeCallbacks(dim)
+        main.removeCallbacks(copyRun)
+        copyPending = false
         val r = root ?: return
         try {
             wm.removeView(r)
@@ -191,8 +204,17 @@ class FloatingSubtitle(private val ctx: Context, private val onCmd: (String) -> 
                 MotionEvent.ACTION_UP -> {
                     if (moved) {
                         prefs.edit().putInt("float_x", p.x).putInt("float_y", p.y).apply()
+                    } else if (copyPending) {
+                        // second tap in time: double tap = hide this sentence, go to the next
+                        main.removeCallbacks(copyRun)
+                        copyPending = false
+                        if (text.isNotBlank()) {
+                            onCmd("hide")
+                            Toast.makeText(ctx, "Hidden", Toast.LENGTH_SHORT).show()
+                        }
                     } else {
-                        copyText()
+                        copyPending = true
+                        main.postDelayed(copyRun, DOUBLE_TAP_MS)
                     }
                 }
             }

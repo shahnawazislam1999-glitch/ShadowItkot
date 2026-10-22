@@ -179,6 +179,13 @@ class WebHost private constructor(val appCtx: Context, val app: AppInfo) {
         var p = sentenceIndex - 1;
         while (p >= 0 && !isPlayable(p)) p--;
         if (p >= 0) jumpToSpecificSentence(p);
+      } else if (c === 'hide') {
+        // Same as the page's Hide button (👁️): hide the current sentence, then move on to the next playable one.
+        if (typeof sentences !== 'undefined' && sentenceIndex >= 0 && sentences[sentenceIndex] != null &&
+            !hiddenSentences.has(sentences[sentenceIndex])) {
+          var b = document.getElementById('actHideBtn');
+          if (b) b.click();
+        }
       }
     } catch (e) {}
     setTimeout(snap, 60);
