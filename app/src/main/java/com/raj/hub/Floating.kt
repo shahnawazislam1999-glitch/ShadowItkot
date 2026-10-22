@@ -1,5 +1,7 @@
 package com.raj.hub
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Color
 import android.graphics.PixelFormat
@@ -17,20 +19,21 @@ import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 
 /**
  * Tiny floating subtitle window (needs "Display over other apps").
- * Shows only the current subtitle with previous / play-pause / next. Very dim (15%) until you touch it.
+ * Shows only the current subtitle with previous / play-pause / next. Fully visible. Tap the text to copy the subtitle.
  * Drag it by the text to move it; the position is remembered.
  */
 class FloatingSubtitle(private val ctx: Context, private val onCmd: (String) -> Unit) {
 
     companion object {
         /** How visible the window is when you are not touching it. 0.15 = 15%. */
-        const val IDLE_ALPHA = 0.15f
+        const val IDLE_ALPHA = 1.0f
 
         /** How visible it gets for a moment when you touch it, so you can see what you tap. */
-        const val TOUCH_ALPHA = 0.65f
+        const val TOUCH_ALPHA = 1.0f
     }
 
     private val wm = ctx.getSystemService(Context.WINDOW_SERVICE) as WindowManager
@@ -85,6 +88,19 @@ class FloatingSubtitle(private val ctx: Context, private val onCmd: (String) -> 
     private fun apply() {
         label?.text = if (text.isBlank()) "SHADOWit" else text
         playBtn?.setImageResource(if (playing) R.drawable.ic_pause else R.drawable.ic_play)
+    }
+
+    /** Tap on the subtitle text = copy it. */
+    private fun copyText() {
+        val t = text.trim()
+        if (t.isEmpty()) return
+        try {
+            val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("subtitle", t))
+            Toast.makeText(ctx, "Copied", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            // clipboard not available
+        }
     }
 
     private fun highlight() {
@@ -151,6 +167,7 @@ class FloatingSubtitle(private val ctx: Context, private val onCmd: (String) -> 
         var downY = 0f
         var startX = 0
         var startY = 0
+        var moved = false
         t.setOnTouchListener { _, e ->
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
@@ -158,9 +175,11 @@ class FloatingSubtitle(private val ctx: Context, private val onCmd: (String) -> 
                     downY = e.rawY
                     startX = p.x
                     startY = p.y
+                    moved = false
                     highlight()
                 }
                 MotionEvent.ACTION_MOVE -> {
+                    if (Math.abs(e.rawX - downX) > dp(8) || Math.abs(e.rawY - downY) > dp(8)) moved = true
                     p.x = startX + (e.rawX - downX).toInt()
                     p.y = startY + (e.rawY - downY).toInt()
                     try {
@@ -170,7 +189,11 @@ class FloatingSubtitle(private val ctx: Context, private val onCmd: (String) -> 
                     }
                 }
                 MotionEvent.ACTION_UP -> {
-                    prefs.edit().putInt("float_x", p.x).putInt("float_y", p.y).apply()
+                    if (moved) {
+                        prefs.edit().putInt("float_x", p.x).putInt("float_y", p.y).apply()
+                    } else {
+                        copyText()
+                    }
                 }
             }
             true

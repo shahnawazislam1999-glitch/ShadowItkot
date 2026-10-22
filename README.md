@@ -13,7 +13,7 @@ Standalone Android app (Kotlin + WebView). Opens straight into **SHADOWit**, no 
 
 - Keeps playing with the screen locked, in the background, and after you clear the app from Recents (a notification stays; tap it to come back, or use its Close button).
 - Notification shows the current subtitle with Previous / Pause / Next / Close.
-- Tiny dim floating subtitle window (15%) with Previous / Play-Pause / Next appears whenever the app is not on screen. Drag it by the text.
+- Tiny floating subtitle window (tap the text to copy) with Previous / Play-Pause / Next appears whenever the app is not on screen. Drag it by the text.
 - Tip: in Recents, long-press the app card and choose "Keep open" / "Lock" so your phone's own cleaner does not kill it.
 
 ## Push to GitHub (fresh start, no old git data)
@@ -43,7 +43,7 @@ Every push builds a new APK. New builds install over the old one (same signing k
 - Name: `app/src/main/res/values/strings.xml`
 - Web address / files / fonts: `app/src/main/assets/apps.json`
 - Permissions: `app/src/main/AndroidManifest.xml` and `app/src/main/java/com/raj/hub/Perms.kt` (only notifications, display over other apps, battery)
-- Floating window dimness: `IDLE_ALPHA` at the top of `Floating.kt` (0.15 = 15%)
+- Floating window opacity: `IDLE_ALPHA` at the top of `Floating.kt`
 - Icon: replace `app/src/main/res/drawable-nodpi/ic_launcher_art.png` (432x432) and `app_logo.png`
 
 The signing key `app/raj-hub.jks` is included on purpose for personal use. Do not use it for the Play Store.
