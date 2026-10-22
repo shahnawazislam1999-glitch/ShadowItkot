@@ -5,6 +5,6 @@
     <string name="from_label">from</string>
     <string name="from_name">RAJ</string>
     <string name="shortcut_perm">Permissions</string>
-    <string name="a11y_label">SHADOWit</string>
-    <string name="a11y_desc">Lets SHADOWit use accessibility features in the future.</string>
+    <string name="channel_playback">Playback</string>
+    <string name="notif_open">Tap to open</string>
 </resources>

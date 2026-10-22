@@ -5,12 +5,20 @@ on:
     branches: [main, master]
   workflow_dispatch:
 
+# Fresh, minimal permission: the built-in token may only read the code and publish the release.
 permissions:
   contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -42,8 +50,6 @@ jobs:
           path: dist/SHADOWit.apk
 
       - name: Publish APK to the "latest" release
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete latest --cleanup-tag --yes || true
           gh release create latest dist/SHADOWit.apk \

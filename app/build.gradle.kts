@@ -13,7 +13,7 @@ android {
         targetSdk = 34
         // Every GitHub build gets a higher number, so a new APK always installs over the old one.
         versionCode = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
-        versionName = "1.0.0"
+        versionName = "1.1.0"
     }
 
     // Fixed personal signing key (kept in the repo on purpose) so updates install over older builds.
