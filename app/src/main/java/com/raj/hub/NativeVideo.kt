@@ -5,7 +5,6 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.ActivityInfo
 import android.graphics.Canvas
-import android.graphics.Outline
 import android.graphics.Color
 import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
@@ -25,7 +24,6 @@ import android.view.LayoutInflater
 import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
-import android.view.ViewOutlineProvider
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ImageView
@@ -66,24 +64,23 @@ import java.util.Locale
  */
 @androidx.annotation.OptIn(UnstableApi::class)
 class NativeVideo(
-    /** A MutableContextWrapper: the visible screen while the app is open, the application otherwise. */
     private val ctx: Context,
     private val appId: String,
     private val web: View,
-    /** The screen that is showing the player right now (null when the app is closed but still playing). */
     private val activityProvider: () -> AppCompatActivity?,
     private val evalJs: (String) -> Unit
 ) {
-    private val app: Context = ctx.applicationContext
+    /** Same as the old activity, only it also survives when the screen is closed. */
+    private val act: Context = ctx
 
     private class Source(val uri: Uri, val name: String, val size: Long, val stamp: Long, val kind: String)
 
     /** Add this view above the WebView (it is hidden until a video is opened). */
-    val panel: FrameLayout = LayoutInflater.from(ctx).inflate(R.layout.panel_native_video, null, false) as FrameLayout
+    val panel: FrameLayout = LayoutInflater.from(act).inflate(R.layout.panel_native_video, null, false) as FrameLayout
 
     private val playerView: PlayerView = panel.findViewById(R.id.nv_player)
-    private val tiles = TextTileView(ctx)
-    private val prefs: SharedPreferences = ctx.getSharedPreferences("rajhub", Context.MODE_PRIVATE)
+    private val tiles = TextTileView(act)
+    private val prefs: SharedPreferences = act.getSharedPreferences("rajhub", Context.MODE_PRIVATE)
     private val main = Handler(Looper.getMainLooper())
 
     private var exo: ExoPlayer? = null
@@ -109,19 +106,10 @@ class NativeVideo(
     private var fxBlurCssPx = 0f
     private var fxOldTv = false
 
-    // video width = the page's cards (reported by the page), rounded like the cards
-    private var cardLeftDp = 8f
-    private var cardWidthDp = -1f
-    private var cardRadiusDp = 16f
-    private var cornerPx = 0f
-
-    // app in background / screen locked: only the sound is decoded (saves battery, seeking is faster)
-    private var bgVideoOff = false
-
     // audio language switching (dual audio MKV, e.g. English / Hindi)
     private var audioList: List<Tracks.Group> = emptyList()
     private var audioPrefApplied = false
-    private val audioChip = ImageView(ctx)
+    private val audioChip = ImageView(act)
 
     init {
         panel.visibility = View.GONE
@@ -136,12 +124,6 @@ class NativeVideo(
         val chipLp = FrameLayout.LayoutParams(dp(44), dp(44), Gravity.TOP or Gravity.END)
         chipLp.setMargins(0, dp(4), dp(4), 0)
         panel.addView(audioChip, chipLp)
-        panel.outlineProvider = object : ViewOutlineProvider() {
-            override fun getOutline(view: View, outline: Outline) {
-                outline.setRoundRect(0, 0, view.width, view.height, cornerPx)
-            }
-        }
-        panel.clipToOutline = true
         playerView.setFullscreenButtonClickListener { setFullscreen(!fullscreen) }
         playerView.subtitleView?.visibility = View.GONE
     }
@@ -150,7 +132,7 @@ class NativeVideo(
 
     private fun ensurePlayer(): ExoPlayer {
         exo?.let { return it }
-        val renderers = DefaultRenderersFactory(app).setEnableDecoderFallback(true)
+        val renderers = DefaultRenderersFactory(act.applicationContext).setEnableDecoderFallback(true)
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(15_000, 40_000, 1_000, 2_000)
             .setTargetBufferBytes(64 * 1024 * 1024)
@@ -162,18 +144,15 @@ class NativeVideo(
             .setUsage(C.USAGE_MEDIA)
             .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
             .build()
-        val p = ExoPlayer.Builder(app, renderers)
-            .setMediaSourceFactory(DefaultMediaSourceFactory(app, DefaultExtractorsFactory()))
+        val p = ExoPlayer.Builder(act.applicationContext, renderers)
+            .setMediaSourceFactory(DefaultMediaSourceFactory(act.applicationContext, DefaultExtractorsFactory()))
             .setLoadControl(loadControl)
             .setAudioAttributes(audio, true)
             .setHandleAudioBecomingNoisy(true)
-            // keeps the CPU awake while it plays, also with the screen off
-            .setWakeMode(C.WAKE_MODE_LOCAL)
             .build()
         // The page draws its own subtitles from the .srt file; never show the ones embedded in the MKV.
         p.trackSelectionParameters = p.trackSelectionParameters.buildUpon()
             .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
-            .setTrackTypeDisabled(C.TRACK_TYPE_VIDEO, bgVideoOff)
             .build()
         p.volume = if (muted) 0f else 1f
         p.addListener(listener)
@@ -270,7 +249,7 @@ class NativeVideo(
             msg.append("This phone cannot decode the sound in this file (" + audioNames.joinToString(", ") + "), so it plays without sound. ")
             msg.append("Re-save the audio as AAC; the video can stay untouched. ")
         }
-        if (videoGroups > 0 && !videoOn && !bgVideoOff) {
+        if (videoGroups > 0 && !videoOn) {
             msg.append("This phone cannot decode the picture in this file (" + videoNames.joinToString(", ") + "). ")
         }
         if (msg.isNotEmpty()) {
@@ -278,7 +257,7 @@ class NativeVideo(
             o.put("e", "warn")
             o.put("msg", msg.toString().trim())
             emit(o)
-            Toast.makeText(app, msg.toString().trim(), Toast.LENGTH_LONG).show()
+            Toast.makeText(act.applicationContext, msg.toString().trim(), Toast.LENGTH_LONG).show()
         }
     }
 
@@ -315,7 +294,7 @@ class NativeVideo(
         val list = all.filter { it.isSupported }
         audioList = list
         if (all.size > list.size && list.isNotEmpty()) {
-            Toast.makeText(app, "Another audio track in this file uses a format this phone cannot play, so it is not listed.", Toast.LENGTH_LONG).show()
+            Toast.makeText(act.applicationContext, "Another audio track in this file uses a format this phone cannot play, so it is not listed.", Toast.LENGTH_LONG).show()
         }
         if (list.size < 2) {
             audioChip.visibility = View.GONE
@@ -355,11 +334,11 @@ class NativeVideo(
 
     private fun showAudioDialog() {
         val list = audioList
-        val act = activityProvider() ?: return
-        if (list.size < 2 || act.isFinishing) return
+        val ownerAct = activityProvider() ?: return
+        if (list.size < 2 || ownerAct.isFinishing) return
         val names = Array(list.size) { audioName(list[it], it) }
         val cur = list.indexOfFirst { it.isSelected }.coerceAtLeast(0)
-        AlertDialog.Builder(act)
+        AlertDialog.Builder(ownerAct)
             .setTitle("Audio")
             .setSingleChoiceItems(names, cur) { d, which ->
                 selectAudio(which, true)
@@ -516,7 +495,7 @@ class NativeVideo(
             } else if (v is TextureView) {
                 v.setLayerType(View.LAYER_TYPE_NONE, null)
             }
-            if (Build.VERSION.SDK_INT >= 31) applyBlur(v, fxBlurCssPx * ctx.resources.displayMetrics.density)
+            if (Build.VERSION.SDK_INT >= 31) applyBlur(v, fxBlurCssPx * act.resources.displayMetrics.density)
         } catch (e: Exception) {
             // effects are optional
         }
@@ -537,55 +516,25 @@ class NativeVideo(
         relayout()
     }
 
-    private fun dp(v: Int): Int = (v * ctx.resources.displayMetrics.density).toInt()
+    private fun dp(v: Int): Int = (v * act.resources.displayMetrics.density).toInt()
 
-    private fun dpf(v: Float): Int = (v * ctx.resources.displayMetrics.density).toInt()
-
-    /** Called by the page: where its cards sit (CSS px = dp), so the video is exactly as wide as they are. */
-    fun setAlign(leftDp: Float, widthDp: Float, radiusDp: Float) {
-        if (leftDp < 0f || widthDp < 40f) return
-        cardLeftDp = leftDp
-        cardWidthDp = widthDp
-        cardRadiusDp = radiusDp.coerceIn(0f, 40f)
-        relayout()
-    }
-
-    /** Panel is as wide as the page's cards, its height follows the video's shape but never takes more than 40% of the screen. */
+    /** Panel height follows the video's shape but never takes more than 40% of the screen (like the old page player). */
     fun relayout() {
         val lp = panel.layoutParams as? LinearLayout.LayoutParams ?: return
-        val dm = ctx.resources.displayMetrics
-        val screenW = dm.widthPixels
-        var ml = 0
-        var mr = 0
+        val dm = act.resources.displayMetrics
         val newH: Int
         if (fullscreen) {
             newH = ViewGroup.LayoutParams.MATCH_PARENT
-            cornerPx = 0f
         } else {
-            ml = dpf(cardLeftDp).coerceIn(0, screenW / 3)
-            mr = if (cardWidthDp > 0f) {
-                (screenW - ml - dpf(cardWidthDp)).coerceIn(0, screenW / 3)
-            } else {
-                ml
-            }
-            val availW = (screenW - ml - mr - maxOf(0, insetL - ml) - maxOf(0, insetR - mr)).coerceAtLeast(1)
+            val availW = (dm.widthPixels - insetL - insetR).coerceAtLeast(1)
             val maxH = maxOf(dp(96), (dm.heightPixels * 0.4f).toInt())
             newH = (availW / videoAspect).toInt().coerceIn(dp(96), maxH) + insetT
-            cornerPx = dpf(cardRadiusDp).toFloat()
         }
-        panel.setPadding(maxOf(0, insetL - ml), insetT, maxOf(0, insetR - mr), 0)
-        var changed = false
+        panel.setPadding(insetL, insetT, insetR, 0)
         if (lp.height != newH) {
             lp.height = newH
-            changed = true
+            panel.layoutParams = lp
         }
-        if (lp.leftMargin != ml || lp.rightMargin != mr) {
-            lp.leftMargin = ml
-            lp.rightMargin = mr
-            changed = true
-        }
-        if (changed) panel.layoutParams = lp
-        panel.invalidateOutline()
     }
 
     private fun applyVisibility() {
@@ -614,20 +563,17 @@ class NativeVideo(
 
     // ------------------------------------------------------------------ lifecycle
 
-    /** The app going to the background must NOT pause the sound any more, it only remembers the position. */
     fun onPause() {
         if (released) return
         savePos()
     }
 
-    /** App in background / screen locked -> only decode the sound. Back in front -> picture again. */
     fun setBackground(on: Boolean) {
-        if (released) return
-        bgVideoOff = on
-        val p = exo ?: return
-        p.trackSelectionParameters = p.trackSelectionParameters.buildUpon()
-            .setTrackTypeDisabled(C.TRACK_TYPE_VIDEO, on)
-            .build()
+        // no-op: the original player code is kept as it was
+    }
+
+    fun setAlign(leftDp: Float, widthDp: Float, radiusDp: Float) {
+        // no-op: the video keeps its original full width
     }
 
     fun release() {
@@ -649,7 +595,7 @@ class NativeVideo(
     private fun key(name: String): String = name + "_" + appId
 
     private fun canOpen(uri: Uri): Boolean = try {
-        ctx.contentResolver.openFileDescriptor(uri, "r")?.use { true } ?: false
+        act.contentResolver.openFileDescriptor(uri, "r")?.use { true } ?: false
     } catch (e: Exception) {
         false
     }
@@ -658,7 +604,7 @@ class NativeVideo(
         var name = "video"
         var size = -1L
         try {
-            ctx.contentResolver.query(uri, null, null, null, null)?.use { c ->
+            act.contentResolver.query(uri, null, null, null, null)?.use { c ->
                 if (c.moveToFirst()) {
                     val ni = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
                     if (ni >= 0) name = c.getString(ni) ?: name
@@ -671,7 +617,7 @@ class NativeVideo(
         }
         if (size < 0) {
             try {
-                ctx.contentResolver.openFileDescriptor(uri, "r")?.use { size = it.statSize }
+                act.contentResolver.openFileDescriptor(uri, "r")?.use { size = it.statSize }
             } catch (e: Exception) {
                 // keep -1
             }
@@ -679,7 +625,7 @@ class NativeVideo(
         return Pair(name, size)
     }
 
-    private fun privateDir(): File = File(ctx.filesDir, "videos/$appId")
+    private fun privateDir(): File = File(act.filesDir, "videos/$appId")
 
     private fun removePrivateExcept(keep: File?) {
         try {
@@ -767,7 +713,7 @@ class NativeVideo(
 
     /** The user picked a video with Android's file picker. */
     fun onPicked(uri: Uri) {
-        val cr = ctx.contentResolver
+        val cr = act.contentResolver
         var persisted = false
         try {
             cr.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -776,7 +722,7 @@ class NativeVideo(
             // this provider does not allow keeping access
         }
         if (!canOpen(uri)) {
-            Toast.makeText(app, "Could not open that file", Toast.LENGTH_LONG).show()
+            Toast.makeText(act.applicationContext, "Could not open that file", Toast.LENGTH_LONG).show()
             return
         }
         val info = readInfo(uri)
@@ -811,22 +757,22 @@ class NativeVideo(
         val dir = privateDir()
         dir.mkdirs()
         if (size > 0) {
-            val free = try { StatFs(ctx.filesDir.path).availableBytes } catch (e: Exception) { Long.MAX_VALUE }
+            val free = try { StatFs(act.filesDir.path).availableBytes } catch (e: Exception) { Long.MAX_VALUE }
             if (free < size + 64L * 1024 * 1024) {
                 commit(uri, name, size, stamp, null)
-                Toast.makeText(app, "Not enough free space to keep a copy. The video plays now but will not be remembered after you close the app.", Toast.LENGTH_LONG).show()
+                Toast.makeText(act.applicationContext, "Not enough free space to keep a copy. The video plays now but will not be remembered after you close the app.", Toast.LENGTH_LONG).show()
                 notifyPage()
                 return
             }
         }
-        Toast.makeText(app, "Saving a private copy of the video so it is remembered…", Toast.LENGTH_LONG).show()
+        Toast.makeText(act.applicationContext, "Saving a private copy of the video so it is remembered…", Toast.LENGTH_LONG).show()
         val ext = name.substringAfterLast('.', "mkv").filter { it.isLetterOrDigit() }.take(5).ifEmpty { "bin" }
         Thread {
             val tmp = File(dir, "video_$stamp.part")
             val dest = File(dir, "video_$stamp.$ext")
             var ok = false
             try {
-                val input = ctx.contentResolver.openInputStream(uri)
+                val input = act.contentResolver.openInputStream(uri)
                 if (input != null) {
                     input.use { ins ->
                         FileOutputStream(tmp).use { out ->
@@ -876,10 +822,10 @@ class NativeVideo(
             notifyPage()
         } else if (canOpen(uri)) {
             commit(uri, name, size, stamp, null)
-            Toast.makeText(app, "Could not keep a copy. The video plays now but will not be remembered after you close the app.", Toast.LENGTH_LONG).show()
+            Toast.makeText(act.applicationContext, "Could not keep a copy. The video plays now but will not be remembered after you close the app.", Toast.LENGTH_LONG).show()
             notifyPage()
         } else {
-            Toast.makeText(app, "Could not read that video file", Toast.LENGTH_LONG).show()
+            Toast.makeText(act.applicationContext, "Could not read that video file", Toast.LENGTH_LONG).show()
         }
     }
 
