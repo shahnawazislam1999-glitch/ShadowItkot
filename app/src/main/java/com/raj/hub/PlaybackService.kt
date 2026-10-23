@@ -8,6 +8,9 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.media.MediaMetadata
+import android.media.session.MediaSession
+import android.media.session.PlaybackState
 import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
@@ -59,6 +62,7 @@ class PlaybackService : Service() {
     private var overlay: FloatingSubtitle? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var lastSig = ""
+    private var session: MediaSession? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -67,6 +71,7 @@ class PlaybackService : Service() {
         inst = this
         createChannel()
         overlay = FloatingSubtitle(this) { c -> WebHost.current()?.mediaCmd(c) }
+        startSession()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -101,6 +106,7 @@ class PlaybackService : Service() {
     override fun onDestroy() {
         overlay?.hide()
         overlay = null
+        stopSession()
         releaseWakeLock()
         if (inst === this) inst = null
         super.onDestroy()
@@ -123,6 +129,74 @@ class PlaybackService : Service() {
         }
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         stopSelf()
+    }
+
+    // ------------------------------------------------------------------ media buttons (pen / headset next + previous)
+
+    /**
+     * A media session makes Android send the hardware Next / Previous / Play / Pause buttons (Bluetooth smart pen,
+     * headset, car) to this app, also while it is minimized or the screen is locked.
+     */
+    private fun startSession() {
+        try {
+            val s = MediaSession(this, "SHADOWit")
+            s.setCallback(object : MediaSession.Callback() {
+                override fun onSkipToNext() {
+                    WebHost.current()?.mediaCmd("next")
+                }
+
+                override fun onSkipToPrevious() {
+                    WebHost.current()?.mediaCmd("prev")
+                }
+
+                override fun onPlay() {
+                    if (!MediaBus.playing) WebHost.current()?.mediaCmd("toggle")
+                }
+
+                override fun onPause() {
+                    if (MediaBus.playing) WebHost.current()?.mediaCmd("toggle")
+                }
+            })
+            s.isActive = true
+            session = s
+            updateSession()
+        } catch (e: Exception) {
+            session = null
+        }
+    }
+
+    private fun updateSession() {
+        val s = session ?: return
+        try {
+            val actions = PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or PlaybackState.ACTION_PLAY_PAUSE or
+                PlaybackState.ACTION_SKIP_TO_NEXT or PlaybackState.ACTION_SKIP_TO_PREVIOUS
+            val st = PlaybackState.Builder()
+                .setActions(actions)
+                .setState(
+                    if (MediaBus.playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED,
+                    PlaybackState.PLAYBACK_POSITION_UNKNOWN,
+                    1f
+                )
+                .build()
+            s.setPlaybackState(st)
+            s.setMetadata(
+                MediaMetadata.Builder()
+                    .putString(MediaMetadata.METADATA_KEY_TITLE, if (MediaBus.text.isNotBlank()) MediaBus.text else getString(R.string.app_name))
+                    .build()
+            )
+        } catch (e: Exception) {
+            // ignore
+        }
+    }
+
+    private fun stopSession() {
+        try {
+            session?.isActive = false
+            session?.release()
+        } catch (e: Exception) {
+            // ignore
+        }
+        session = null
     }
 
     // ------------------------------------------------------------------ wake lock
@@ -233,6 +307,7 @@ class PlaybackService : Service() {
         val sig = MediaBus.text + "|" + MediaBus.index + "|" + MediaBus.total + "|" + MediaBus.playing
         if (sig != lastSig) {
             lastSig = sig
+            updateSession()
             try {
                 val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
                 nm.notify(NOTIF_ID, buildNotification())

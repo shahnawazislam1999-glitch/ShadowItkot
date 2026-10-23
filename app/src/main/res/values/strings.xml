@@ -7,6 +7,5 @@
     <string name="shortcut_perm">Permissions</string>
     <string name="channel_playback">Playback</string>
     <string name="notif_open">Tap to open</string>
-    <!-- kept only so an old leftover res/xml/accessibility_config.xml cannot break the build -->
-    <string name="a11y_desc">Not used.</string>
+    <string name="a11y_desc">Lets the pen's up/down (page) buttons change the subtitle while SHADOWit plays in the background. Only those keys are used. Nothing on the screen is read.</string>
 </resources>

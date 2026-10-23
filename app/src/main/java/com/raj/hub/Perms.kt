@@ -1,6 +1,7 @@
 package com.raj.hub
 
 import android.Manifest
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -68,6 +69,18 @@ object Perms {
             desc = "Shows the tiny floating subtitle window when SHADOWit is in the background.",
             special = { Settings.canDrawOverlays(it) },
             settings = { c -> listOf(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, pkgUri(c))) }
+        ),
+
+        PermItem(
+            id = "penkeys",
+            title = "Pen buttons when minimized (optional)",
+            desc = "Lets the pen's up/down buttons change the subtitle while the floating window is showing. Turn on SHADOWit in Accessibility. Only those keys are used.",
+            special = { c ->
+                val me = ComponentName(c, PenKeyService::class.java)
+                val list = Settings.Secure.getString(c.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: ""
+                list.split(':').any { ComponentName.unflattenFromString(it) == me }
+            },
+            settings = { listOf(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
         ),
 
         PermItem(
