@@ -13,7 +13,7 @@ Standalone Android app (Kotlin + WebView). Opens straight into **SHADOWit**, no 
 
 - Keeps playing with the screen locked, in the background, and after you clear the app from Recents (a notification stays; tap it to come back, or use its Close button).
 - Notification shows the current subtitle with Previous / Pause / Next / Close.
-- Tiny floating subtitle window (tap the text to copy, **double-tap it to hide that sentence and jump to the next**) with Previous / Play-Pause / Next appears whenever the app is not on screen. Drag it by the text.
+- Tiny floating subtitle window (tap the text to copy, double-tap to hide that sentence) with Previous / Play-Pause / Next appears whenever the app is not on screen. Drag it by the text.
 - Tip: in Recents, long-press the app card and choose "Keep open" / "Lock" so your phone's own cleaner does not kill it.
 
 ## Push to GitHub (fresh start, no old git data)
