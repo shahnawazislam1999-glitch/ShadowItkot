@@ -770,6 +770,7 @@ class WebHost private constructor(val appCtx: Context, val app: AppInfo) {
             main.post {
                 if (destroyed) return@post
                 if (wasPlaying != playing) onPlayingChanged()
+                nv.setSubtitle(MediaBus.text, MediaBus.playing)
                 PlaybackService.refreshNow()
             }
         }

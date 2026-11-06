@@ -27,6 +27,8 @@ import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ImageView
+import android.widget.TextView
+import android.util.TypedValue
 import android.widget.Toast
 import androidx.annotation.RequiresApi
 import androidx.appcompat.app.AlertDialog
@@ -108,7 +110,12 @@ class NativeVideo(
     private var tickCount = 0
     private var copyGen = 0
 
-    private val FS_VIDEO_FRACTION = 0.70f   // share of the (landscape) screen height the video gets in full screen
+    // full screen: clean picture with the subtitle drawn on it + three dim buttons (previous / play-pause / next)
+    private val subtitleText = TextView(act)
+    private val fsControls = LinearLayout(act)
+    private val fsPrev = ImageView(act)
+    private val fsPlay = ImageView(act)
+    private val fsNext = ImageView(act)
 
     private var videoAspect = 16f / 9f
     private var insetL = 0
@@ -145,6 +152,36 @@ class NativeVideo(
         val chipLp = FrameLayout.LayoutParams(dp(44), dp(44), Gravity.TOP or Gravity.END)
         chipLp.setMargins(0, dp(4), dp(4), 0)
         panel.addView(audioChip, chipLp)
+
+        // on-video subtitle (touches pass through to the player)
+        subtitleText.setTextColor(Color.parseColor("#FFE24A"))
+        subtitleText.setTypeface(subtitleText.typeface, android.graphics.Typeface.BOLD)
+        subtitleText.gravity = Gravity.CENTER
+        subtitleText.setShadowLayer(7f, 0f, 1.5f, Color.BLACK)
+        subtitleText.setLineSpacing(0f, 1.05f)
+        subtitleText.visibility = View.GONE
+        panel.addView(subtitleText, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL))
+
+        // three very dim buttons, middle of the right edge
+        fsControls.orientation = LinearLayout.VERTICAL
+        fsControls.visibility = View.GONE
+        fsPrev.setImageResource(R.drawable.ic_prev)
+        fsPlay.setImageResource(R.drawable.ic_play)
+        fsNext.setImageResource(R.drawable.ic_next)
+        fsPrev.contentDescription = "Previous sentence"
+        fsPlay.contentDescription = "Play or pause"
+        fsNext.contentDescription = "Next sentence"
+        for (b in listOf(fsPrev, fsPlay, fsNext)) {
+            b.alpha = 0.35f
+            b.setPadding(dp(11), dp(11), dp(11), dp(11))
+            fsControls.addView(b, LinearLayout.LayoutParams(dp(50), dp(50)))
+        }
+        fsPrev.setOnClickListener { evalJs("window.__rajMedia&&window.__rajMedia.cmd('prev')") }
+        fsPlay.setOnClickListener { evalJs("window.__rajMedia&&window.__rajMedia.cmd('toggle')") }
+        fsNext.setOnClickListener { evalJs("window.__rajMedia&&window.__rajMedia.cmd('next')") }
+        val ctlLp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.END or Gravity.CENTER_VERTICAL)
+        ctlLp.setMargins(0, 0, dp(10), 0)
+        panel.addView(fsControls, ctlLp)
         playerView.setFullscreenButtonClickListener { setFullscreen(!fullscreen) }
         playerView.subtitleView?.visibility = View.GONE
     }
@@ -636,10 +673,8 @@ class NativeVideo(
         val dm = act.resources.displayMetrics
         val newH: Int
         if (fullscreen) {
-            // Landscape full screen: the video takes the top part, the page (subtitles only) stays visible below it.
-            // Uses the short side of the screen so the height is right before and after the rotation finishes.
-            val shortSide = minOf(dm.widthPixels, dm.heightPixels)
-            newH = (shortSide * FS_VIDEO_FRACTION).toInt().coerceAtLeast(dp(96))
+            // clean full screen: the video fills the screen, the page is hidden (it keeps running in the background)
+            newH = ViewGroup.LayoutParams.MATCH_PARENT
         } else {
             val availW = (dm.widthPixels - insetL - insetR).coerceAtLeast(1)
             val maxH = maxOf(dp(96), (dm.heightPixels * 0.4f).toInt())
@@ -650,6 +685,31 @@ class NativeVideo(
             lp.height = newH
             panel.layoutParams = lp
         }
+        web.visibility = if (fullscreen) View.GONE else View.VISIBLE
+        // black behind the picture while full screen (instead of the app's dark blue)
+        (panel.parent as? View)?.setBackgroundColor(if (fullscreen) Color.BLACK else Color.TRANSPARENT)
+        layoutFsOverlay()
+    }
+
+    /** Sizes and shows / hides the on-video subtitle and the three buttons. */
+    private fun layoutFsOverlay() {
+        val dm = act.resources.displayMetrics
+        val shortSide = minOf(dm.widthPixels, dm.heightPixels)
+        subtitleText.setTextSize(TypedValue.COMPLEX_UNIT_PX, shortSide * 0.055f)
+        val lp = subtitleText.layoutParams as FrameLayout.LayoutParams
+        val side = maxOf(dp(24), (maxOf(dm.widthPixels, dm.heightPixels) * 0.12f).toInt())
+        lp.setMargins(side, 0, side, (shortSide * 0.09f).toInt())
+        subtitleText.layoutParams = lp
+        subtitleText.visibility = if (fullscreen && subtitleText.text.isNotEmpty()) View.VISIBLE else View.GONE
+        fsControls.visibility = if (fullscreen) View.VISIBLE else View.GONE
+        fsPlay.setImageResource(if (MediaBus.playing) R.drawable.ic_pause else R.drawable.ic_play)
+    }
+
+    /** The sentence that is playing now (sent by the page) and whether it is playing. Shown on the video while full screen. */
+    fun setSubtitle(text: String, playing: Boolean) {
+        subtitleText.text = text
+        fsPlay.setImageResource(if (playing) R.drawable.ic_pause else R.drawable.ic_play)
+        subtitleText.visibility = if (fullscreen && text.isNotEmpty()) View.VISIBLE else View.GONE
     }
 
     private fun applyVisibility() {
@@ -675,8 +735,6 @@ class NativeVideo(
             return
         }
         fullscreen = on
-        // The page stays visible below the video: it shows only the subtitle line while full screen (see the page's nv-vfs mode).
-        web.visibility = View.VISIBLE
         activityProvider()?.requestedOrientation = if (on) ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE else ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         relayout()
         notifyFullscreen(on)
