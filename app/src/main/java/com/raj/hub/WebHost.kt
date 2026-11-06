@@ -141,10 +141,188 @@ class WebHost private constructor(val appCtx: Context, val app: AppInfo) {
   var last = '';
   var lastAlign = '';
 
+  // ---- Free play ("unlink"): the film plays from start to end, the sentence repeater is stopped,
+  // the subtitle on screen simply follows the film's time. Used by the full screen unlink button.
+  var free = false, freeIdx = -2, freeTimer = null, sc = null;
+
+  function vpl() { try { return videoPlayer; } catch (e) { return null; } }
+  function cleanLine(t) { return String(t || '').replace(/\s+/g, ' ').trim(); }
+
+  // index of the subtitle showing at raw video time t (seconds), or -1 in a gap
+  function subAt(t) {
+    try {
+      var subs = videoSubtitles;
+      if (!subs || !subs.length) return -1;
+      var mt = getSubtitleMatchingTime(t);
+      var h = freeIdx;
+      if (h >= 0 && h < subs.length && subs[h] && mt >= subs[h].start && mt < subs[h].end) return h;
+      for (var i = 0; i < subs.length; i++) {
+        var u = subs[i];
+        if (u && mt >= u.start && mt < u.end) return i;
+      }
+    } catch (e) {}
+    return -1;
+  }
+
+  // first subtitle that starts after raw video time t, or -1
+  function subAfter(t) {
+    try {
+      var subs = videoSubtitles, mt = getSubtitleMatchingTime(t);
+      for (var i = 0; i < subs.length; i++) if (subs[i] && subs[i].start > mt + 0.05) return i;
+    } catch (e) {}
+    return -1;
+  }
+
+  // last subtitle that started clearly before raw video time t, or -1
+  function subBefore(t) {
+    try {
+      var subs = videoSubtitles, mt = getSubtitleMatchingTime(t), r = -1;
+      for (var i = 0; i < subs.length; i++) { if (subs[i] && subs[i].start < mt - 0.7) r = i; else if (subs[i] && subs[i].start >= mt) break; }
+      return r;
+    } catch (e) {}
+    return -1;
+  }
+
+  function seekToSub(i) {
+    try { videoPlayer.currentTime = getVideoTimeForSubtitleTime(videoSubtitles[i].start); } catch (e) {}
+  }
+
+  // stops the page's sentence repeater completely (same pieces togglePlayPause stops, plus pending jump / seek callbacks)
+  function stopEngine() {
+    try { isPlaying = false; } catch (e) {}
+    try { if (window.jumpTimeout) clearTimeout(window.jumpTimeout); isJumping = false; } catch (e) {}
+    try { ++videoSeekToken; videoPlayer.onseeked = null; } catch (e) {}
+    try { if (window.bgVideoInterval) clearInterval(window.bgVideoInterval); } catch (e) {}
+    try { if (videoPollingFrame) cancelAnimationFrame(videoPollingFrame); } catch (e) {}
+    try { clearTimeout(delayTimeout); } catch (e) {}
+    try { synth.cancel(); } catch (e) {}
+    try { stopPauseCountdown(); } catch (e) {}
+    try { clearWordTimers(); } catch (e) {}
+    try { updateFloatingBtn(); } catch (e) {}
+  }
+
+  function showFreeSentence(i) {
+    try { sentenceIndex = i; } catch (e) {}
+    try { progressText.innerText = 'Sentence: ' + (i + 1) + '/' + sentences.length + ' (free play)'; } catch (e) {}
+    try {
+      currentSentenceDiv.innerHTML = getPlaybackGroupDisplayHtml([i]) + renderSecondSrtCurrentLine() + renderStickyNoteCurrentLine(i);
+    } catch (e) {}
+    try { highlightActivePlaylistSentence(); } catch (e) {}
+    try { updateActiveSentenceToolbar(); } catch (e) {}
+    try { saveProgress(); } catch (e) {}
+  }
+
+  function freeTick() {
+    if (!free) return;
+    try {
+      var v = vpl();
+      var i = subAt(v ? v.currentTime : 0);
+      if (i !== freeIdx) {
+        freeIdx = i;
+        if (i >= 0) showFreeSentence(i);
+      }
+    } catch (e) {}
+    snap();
+  }
+
+  function enterFree() {
+    if (free) return;
+    free = true;
+    freeIdx = -2;
+    stopEngine();
+    try { videoPlayer.playbackRate = parseFloat(speedInput.value) || 1.0; } catch (e) {}
+    try { var pr = videoPlayer.play(); if (pr && pr.catch) pr.catch(function () {}); } catch (e) {}
+    if (freeTimer) clearInterval(freeTimer);
+    freeTimer = setInterval(freeTick, 120);
+    setTimeout(freeTick, 60);
+  }
+
+  function exitFree() {
+    if (!free) return;
+    free = false;
+    if (freeTimer) { clearInterval(freeTimer); freeTimer = null; }
+    var was = false;
+    try { was = !videoPlayer.paused; } catch (e) {}
+    try { videoPlayer.pause(); } catch (e) {}
+    try {
+      var i = (freeIdx >= 0) ? freeIdx : sentenceIndex;
+      if (typeof i !== 'number' || i < 0 || i >= sentences.length) i = sentenceIndex;
+      if (!isPlayable(i)) {
+        var n = getNextPlayableIndexAfter(i);
+        if (n === -1) n = getFirstPlayableIndex();
+        if (n !== -1) i = n;
+      }
+      isPlaying = was;                 // jumpToSpecificSentence keeps playing only if this is true
+      jumpToSpecificSentence(i);
+    } catch (e) {}
+    freeIdx = -2;
+    setTimeout(snap, 60);
+    setTimeout(snap, 450);
+  }
+
+  function freeToggle() {
+    try { if (videoPlayer.paused) { var pr = videoPlayer.play(); if (pr && pr.catch) pr.catch(function () {}); } else videoPlayer.pause(); } catch (e) {}
+    setTimeout(snap, 80);
+  }
+
+  // hide button while free play: same effect as the eye button (sentence is hidden), but the film just keeps playing
+  function freeHide() {
+    try {
+      var i = (freeIdx >= 0) ? freeIdx : sentenceIndex;
+      if (!sentences || i < 0 || i >= sentences.length) return;
+      hiddenSentences.add(sentences[i]);
+      localStorage.setItem('app_hidden', JSON.stringify(Array.from(hiddenSentences)));
+      try { updateVisibilityStates(); } catch (e) {}
+      try { renderPlaylist(); } catch (e) {}
+    } catch (e) {}
+    snap();
+  }
+
+  // position bar: finger down = pause the repeater, finger up = continue from the new place
+  function scrubStart() {
+    try {
+      if (free) { sc = { was: !videoPlayer.paused }; videoPlayer.pause(); }
+      else { sc = { was: !!isPlaying }; if (isPlaying) togglePlayPause(); }
+    } catch (e) { sc = null; }
+  }
+
+  function scrubEnd(ms) {
+    var s = sc; sc = null;
+    if (!s || !(ms >= 0)) return;
+    var t = ms / 1000;
+    try {
+      if (free) {
+        videoPlayer.currentTime = t;
+        freeIdx = -2;
+        if (s.was) { var pr = videoPlayer.play(); if (pr && pr.catch) pr.catch(function () {}); }
+        setTimeout(freeTick, 150);
+      } else if (typeof videoSubtitles !== 'undefined' && videoSubtitles && videoSubtitles.length) {
+        var i = subAt(t);
+        if (i < 0) i = subAfter(t);
+        if (i < 0) i = videoSubtitles.length - 1;
+        if (!isPlayable(i)) {
+          var n = getNextPlayableIndexAfter(i);
+          if (n === -1) { n = i - 1; while (n >= 0 && !isPlayable(n)) n--; }
+          if (n >= 0) i = n;
+        }
+        isPlaying = s.was;
+        jumpToSpecificSentence(i);
+      }
+    } catch (e) {}
+    setTimeout(snap, 100);
+    setTimeout(snap, 500);
+  }
+
   function snap() {
     try {
       var total = 0, idx = 0, text = '', pl = false;
-      if (typeof sentences !== 'undefined' && sentences && sentences.length) {
+      if (free && typeof sentences !== 'undefined' && sentences && sentences.length) {
+        total = sentences.length;
+        pl = !videoPlayer.paused;
+        var fi = (freeIdx >= 0) ? freeIdx : -1;
+        idx = (fi >= 0 ? fi : sentenceIndex) + 1;
+        if (fi >= 0 && !hiddenSentences.has(sentences[fi])) text = cleanLine(sentences[fi]);
+      } else if (typeof sentences !== 'undefined' && sentences && sentences.length) {
         total = sentences.length;
         pl = !!isPlaying;
         var gs = sentenceIndex, ge = sentenceIndex;
@@ -170,6 +348,22 @@ class WebHost private constructor(val appCtx: Context, val app: AppInfo) {
 
   function cmd(c) {
     try {
+      if (c === 'unlink:1') { enterFree(); return; }
+      if (c === 'unlink:0') { exitFree(); return; }
+      if (free) {
+        if (c === 'toggle') freeToggle();
+        else if (c === 'hide') freeHide();
+        else if (c === 'next') {
+          var nx = subAfter(videoPlayer.currentTime);
+          if (nx !== -1) { seekToSub(nx); freeIdx = -2; }
+        } else if (c === 'prev') {
+          var pv = subBefore(videoPlayer.currentTime);
+          if (pv !== -1) { seekToSub(pv); freeIdx = -2; }
+        }
+        setTimeout(snap, 60);
+        setTimeout(snap, 450);
+        return;
+      }
       if (c === 'toggle') {
         togglePlayPause();
       } else if (c === 'hide') {
@@ -207,7 +401,17 @@ class WebHost private constructor(val appCtx: Context, val app: AppInfo) {
     } catch (e) {}
   }
 
-  window.__rajMedia = { cmd: cmd, snap: snap, align: align };
+  // anything else that calls togglePlayPause() (headset / lock-screen buttons) must not restart the repeater in free play
+  try {
+    if (typeof togglePlayPause === 'function' && !togglePlayPause.__rajWrapped) {
+      var origToggle = togglePlayPause;
+      var wrapped = function () { if (free) { freeToggle(); return; } return origToggle.apply(this, arguments); };
+      wrapped.__rajWrapped = true;
+      window.togglePlayPause = wrapped;
+    }
+  } catch (e) {}
+
+  window.__rajMedia = { cmd: cmd, snap: snap, align: align, scrubStart: scrubStart, scrubEnd: scrubEnd };
   setInterval(snap, 300);
   setInterval(align, 1500);
   window.addEventListener('resize', align);

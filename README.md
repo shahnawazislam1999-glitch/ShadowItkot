@@ -9,6 +9,13 @@ Standalone Android app (Kotlin + WebView). Opens straight into **SHADOWit**, no 
 - Press **Back twice** to exit. Long-press the app icon > **Permissions** to reopen the Permission Center.
 - Files the page saves go to **Downloads/SHADOWit**.
 
+## Full screen video controls
+
+- By default only the picture and the subtitle show. Tap the screen: the position bar (just above the subtitle), the volume bar (top left) and the buttons appear, and hide again about 2 seconds after your last touch.
+- Position bar: slide with your finger, the picture follows. Volume bar: phone media volume.
+- Right-edge buttons: Previous, Play/Pause, Next, **Unlink** (film plays normally from first to last, no sentence repeat; tap again to go back to repeating) and **Hide subtitle** (hides this sentence and moves on).
+- Full screen always starts in normal repeat mode with the controls hidden.
+
 ## Background play
 
 - Keeps playing with the screen locked, in the background, and after you clear the app from Recents (a notification stays; tap it to come back, or use its Close button).

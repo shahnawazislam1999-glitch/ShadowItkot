@@ -16,6 +16,9 @@ import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.media.AudioManager
+import android.os.ParcelFileDescriptor
 import android.os.StatFs
 import android.provider.OpenableColumns
 import android.text.TextPaint
@@ -116,6 +119,28 @@ class NativeVideo(
     private val fsPrev = ImageView(act)
     private val fsPlay = ImageView(act)
     private val fsNext = ImageView(act)
+    private val fsUnlink = ImageView(act)
+    private val fsHide = ImageView(act)
+
+    // full screen: everything except picture + subtitle stays hidden until the screen is tapped, then hides again by itself
+    private val tapLayer = View(act)
+    private val seekBar = FsSlider(act)
+    private val volBar = FsSlider(act)
+    private val audioMgr = act.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    private var unlinked = false          // "free play": the page stops repeating sentences, the film just plays
+    private var fsUiVisible = false
+    private var scrubbing = false
+    private var lastScrubAt = 0L
+    private var audioChipWanted = false
+    private var ctlWanted = true
+    private val hideRunnable = Runnable { hideFsUi() }
+    private val uiTick = object : Runnable {
+        override fun run() {
+            if (released || !fsUiVisible) return
+            refreshSliders()
+            main.postDelayed(this, 250)
+        }
+    }
 
     private var videoAspect = 16f / 9f
     private var insetL = 0
@@ -142,6 +167,10 @@ class NativeVideo(
     init {
         panel.visibility = View.GONE
         panel.addView(tiles, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        // invisible layer that catches the "tap to show the controls" touch while full screen
+        tapLayer.visibility = View.GONE
+        tapLayer.setOnClickListener { onFsTap() }
+        panel.addView(tapLayer, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         // only a small speaker icon, very faint (10% opacity) so it does not distract from the picture
         audioChip.setImageResource(R.drawable.ic_audio_track)
         audioChip.alpha = 0.10f
@@ -171,17 +200,64 @@ class NativeVideo(
         fsPrev.contentDescription = "Previous sentence"
         fsPlay.contentDescription = "Play or pause"
         fsNext.contentDescription = "Next sentence"
-        for (b in listOf(fsPrev, fsPlay, fsNext)) {
+        fsUnlink.setImageResource(R.drawable.ic_unlink)
+        fsHide.setImageResource(R.drawable.ic_eye_off)
+        fsUnlink.contentDescription = "Unlink subtitles: play the film normally"
+        fsHide.contentDescription = "Hide this subtitle"
+        for (b in listOf(fsPrev, fsPlay, fsNext, fsUnlink, fsHide)) {
             b.alpha = 0.35f
             b.setPadding(dp(11), dp(11), dp(11), dp(11))
             fsControls.addView(b, LinearLayout.LayoutParams(dp(50), dp(50)))
         }
-        fsPrev.setOnClickListener { evalJs("window.__rajMedia&&window.__rajMedia.cmd('prev')") }
-        fsPlay.setOnClickListener { evalJs("window.__rajMedia&&window.__rajMedia.cmd('toggle')") }
-        fsNext.setOnClickListener { evalJs("window.__rajMedia&&window.__rajMedia.cmd('next')") }
+        fsPrev.setOnClickListener { evalJs("window.__rajMedia&&window.__rajMedia.cmd('prev')"); poke() }
+        fsPlay.setOnClickListener { evalJs("window.__rajMedia&&window.__rajMedia.cmd('toggle')"); poke() }
+        fsNext.setOnClickListener { evalJs("window.__rajMedia&&window.__rajMedia.cmd('next')"); poke() }
+        fsUnlink.setOnClickListener { setUnlinked(!unlinked); poke() }
+        fsHide.setOnClickListener { evalJs("window.__rajMedia&&window.__rajMedia.cmd('hide')"); poke() }
         val ctlLp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.END or Gravity.CENTER_VERTICAL)
         ctlLp.setMargins(0, 0, dp(10), 0)
         panel.addView(fsControls, ctlLp)
+
+        // position bar (sits on the line just above the subtitle) and volume bar (top left)
+        seekBar.contentDescription = "Video position"
+        seekBar.visibility = View.GONE
+        seekBar.onStart = {
+            scrubbing = true
+            main.removeCallbacks(hideRunnable)
+            evalJs("window.__rajMedia&&window.__rajMedia.scrubStart()")
+        }
+        seekBar.onChange = { f ->
+            val dur = exo?.duration ?: C.TIME_UNSET
+            if (dur != C.TIME_UNSET && dur > 0L) {
+                val ms = (f * dur).toLong()
+                seekBar.setLabels(fmtMs(ms), fmtMs(dur))
+                val now = SystemClock.uptimeMillis()
+                if (now - lastScrubAt > 90L) {
+                    lastScrubAt = now
+                    liveSeek(ms)
+                }
+            }
+        }
+        seekBar.onEnd = { f ->
+            scrubbing = false
+            val dur = exo?.duration ?: C.TIME_UNSET
+            if (dur != C.TIME_UNSET && dur > 0L) {
+                val ms = (f * dur).toLong()
+                liveSeek(ms)
+                evalJs("window.__rajMedia&&window.__rajMedia.scrubEnd(" + ms + ")")
+            } else {
+                evalJs("window.__rajMedia&&window.__rajMedia.scrubEnd(-1)")
+            }
+            poke()
+        }
+        panel.addView(seekBar, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52), Gravity.BOTTOM))
+
+        volBar.contentDescription = "Volume"
+        volBar.visibility = View.GONE
+        volBar.onStart = { main.removeCallbacks(hideRunnable) }
+        volBar.onChange = { f -> setSysVolume(f) }
+        volBar.onEnd = { _ -> poke() }
+        panel.addView(volBar, FrameLayout.LayoutParams(dp(240), dp(48), Gravity.TOP or Gravity.START))
         playerView.setFullscreenButtonClickListener { setFullscreen(!fullscreen) }
         playerView.subtitleView?.visibility = View.GONE
     }
@@ -437,7 +513,8 @@ class NativeVideo(
             Toast.makeText(act.applicationContext, "Another audio track in this file uses a format this phone cannot play, so it is not listed.", Toast.LENGTH_LONG).show()
         }
         if (list.size < 2) {
-            audioChip.visibility = View.GONE
+            audioChipWanted = false
+            applyFsUi()
             return
         }
         if (!audioPrefApplied) {
@@ -455,7 +532,8 @@ class NativeVideo(
             }
         }
         val sel = list.indexOfFirst { it.isSelected }.coerceAtLeast(0)
-        audioChip.visibility = View.VISIBLE
+        audioChipWanted = true
+        applyFsUi()
     }
 
     private fun selectAudio(idx: Int, remember: Boolean) {
@@ -598,7 +676,8 @@ class NativeVideo(
     }
 
     fun setControls(on: Boolean) {
-        playerView.useController = on
+        ctlWanted = on
+        playerView.useController = on && !fullscreen
     }
 
     fun setVisible(on: Boolean) {
@@ -701,8 +780,156 @@ class NativeVideo(
         lp.setMargins(side, 0, side, (shortSide * 0.09f).toInt())
         subtitleText.layoutParams = lp
         subtitleText.visibility = if (fullscreen && subtitleText.text.isNotEmpty()) View.VISIBLE else View.GONE
-        fsControls.visibility = if (fullscreen) View.VISIBLE else View.GONE
+        // position bar on the line just above the subtitle (about a quarter of the screen height from the bottom)
+        val slp = seekBar.layoutParams as FrameLayout.LayoutParams
+        slp.setMargins(dp(14), 0, dp(80), maxOf(0, (shortSide * 0.26f).toInt() - dp(26)))
+        seekBar.layoutParams = slp
+        val vlp = volBar.layoutParams as FrameLayout.LayoutParams
+        vlp.setMargins(dp(14), dp(8), 0, 0)
+        volBar.layoutParams = vlp
         fsPlay.setImageResource(if (MediaBus.playing) R.drawable.ic_pause else R.drawable.ic_play)
+        applyFsUi()
+    }
+
+    // ------------------------------------------------------------------ full screen: hidden controls, tap to show
+
+    private fun onFsTap() {
+        if (!fullscreen) return
+        if (fsUiVisible) hideFsUi() else showFsUi()
+    }
+
+    private fun showFsUi() {
+        if (!fullscreen) return
+        fsUiVisible = true
+        applyFsUi()
+        refreshSliders()
+        main.removeCallbacks(uiTick)
+        main.postDelayed(uiTick, 250)
+        poke()
+    }
+
+    /** Any touch on a control: keep the controls up for two more seconds. */
+    private fun poke() {
+        main.removeCallbacks(hideRunnable)
+        if (fsUiVisible) main.postDelayed(hideRunnable, 2000)
+    }
+
+    private fun hideFsUi() {
+        if (scrubbing || seekBar.dragging || volBar.dragging) {
+            poke()
+            return
+        }
+        fsUiVisible = false
+        main.removeCallbacks(uiTick)
+        main.removeCallbacks(hideRunnable)
+        applyFsUi()
+    }
+
+    private fun fade(v: View, show: Boolean) {
+        if (!fullscreen) {
+            v.animate().cancel()
+            v.alpha = 1f
+            v.visibility = View.GONE
+            return
+        }
+        if (show) {
+            if (v.visibility != View.VISIBLE) {
+                v.alpha = 0f
+                v.visibility = View.VISIBLE
+            }
+            v.animate().alpha(1f).setDuration(140).start()
+        } else {
+            if (v.visibility != View.VISIBLE) {
+                v.animate().cancel()
+                v.visibility = View.INVISIBLE
+                return
+            }
+            v.animate().alpha(0f).setDuration(140).withEndAction {
+                if (!(fullscreen && fsUiVisible)) v.visibility = View.INVISIBLE
+            }.start()
+        }
+    }
+
+    /** One place decides what is visible: normal screen = as before; full screen = only picture + subtitle until tapped. */
+    private fun applyFsUi() {
+        val show = fullscreen && fsUiVisible
+        tapLayer.visibility = if (fullscreen) View.VISIBLE else View.GONE
+        fade(fsControls, show)
+        fade(seekBar, show)
+        fade(volBar, show)
+        if (!audioChipWanted) {
+            audioChip.visibility = View.GONE
+        } else if (!fullscreen) {
+            audioChip.alpha = 0.10f
+            audioChip.visibility = View.VISIBLE
+        } else if (show) {
+            audioChip.alpha = 0.45f
+            audioChip.visibility = View.VISIBLE
+        } else {
+            audioChip.visibility = View.INVISIBLE
+        }
+    }
+
+    private fun refreshSliders() {
+        val p = exo
+        if (p != null && !seekBar.dragging && !scrubbing) {
+            val dur = p.duration
+            val pos = p.currentPosition.coerceAtLeast(0L)
+            if (dur != C.TIME_UNSET && dur > 0L) {
+                seekBar.setFraction(pos.toFloat() / dur.toFloat())
+                seekBar.setLabels(fmtMs(pos), fmtMs(dur))
+            }
+        }
+        if (!volBar.dragging) {
+            try {
+                val max = audioMgr.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+                val cur = audioMgr.getStreamVolume(AudioManager.STREAM_MUSIC)
+                volBar.setFraction(cur.toFloat() / max)
+                volBar.setLabels("Volume " + (cur * 100 / max) + "%", "")
+            } catch (e: Exception) {
+                // volume bar is optional
+            }
+        }
+    }
+
+    private fun setSysVolume(f: Float) {
+        try {
+            val max = audioMgr.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+            val v = Math.round(f * max).coerceIn(0, max)
+            audioMgr.setStreamVolume(AudioManager.STREAM_MUSIC, v, 0)
+            volBar.setLabels("Volume " + (v * 100 / max) + "%", "")
+        } catch (e: Exception) {
+            // some phones refuse in Do Not Disturb; the hardware keys still work
+        }
+    }
+
+    /** Moves the picture while the finger slides on the position bar (the page's sentence player is paused meanwhile). */
+    private fun liveSeek(ms: Long) {
+        val p = exo ?: return
+        var target = ms.coerceAtLeast(0L)
+        val dur = p.duration
+        if (dur != C.TIME_UNSET && dur > 100L && target >= dur) target = dur - 50L
+        p.seekTo(target)
+        main.postDelayed({ if (!released) pushState() }, 60)
+    }
+
+    /** Unlink: the page stops repeating sentences and the film plays from start to end; subtitles still follow the film. */
+    private fun setUnlinked(on: Boolean) {
+        unlinked = on
+        updateUnlinkUi()
+        evalJs("window.__rajMedia&&window.__rajMedia.cmd('" + (if (on) "unlink:1" else "unlink:0") + "')")
+    }
+
+    private fun updateUnlinkUi() {
+        if (unlinked) {
+            fsUnlink.alpha = 0.95f
+            fsUnlink.setColorFilter(Color.parseColor("#FF8A4C"))
+            fsUnlink.contentDescription = "Film plays normally (tap to link subtitles again)"
+        } else {
+            fsUnlink.alpha = 0.35f
+            fsUnlink.clearColorFilter()
+            fsUnlink.contentDescription = "Unlink subtitles: play the film normally"
+        }
     }
 
     /** The sentence that is playing now (sent by the page) and whether it is playing. Shown on the video while full screen. */
@@ -735,6 +962,17 @@ class NativeVideo(
             return
         }
         fullscreen = on
+        // always start and end full screen in the normal (linked, repeating) mode, with the controls hidden
+        if (unlinked) {
+            unlinked = false
+            evalJs("window.__rajMedia&&window.__rajMedia.cmd('unlink:0')")
+        }
+        updateUnlinkUi()
+        fsUiVisible = false
+        scrubbing = false
+        main.removeCallbacks(uiTick)
+        main.removeCallbacks(hideRunnable)
+        playerView.useController = ctlWanted && !on
         activityProvider()?.requestedOrientation = if (on) ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE else ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         relayout()
         notifyFullscreen(on)
@@ -898,7 +1136,8 @@ class NativeVideo(
             errRetryAtMs = -1L
             recovering = false
             audioList = emptyList()
-            audioChip.visibility = View.GONE
+            audioChipWanted = false
+            applyFsUi()
             videoAspect = 16f / 9f
             p.setMediaItem(MediaItem.fromUri(s.uri), startMs)
             p.playWhenReady = false
@@ -915,6 +1154,71 @@ class NativeVideo(
         relayout()
         pushState()
         if (fullscreen) notifyFullscreen(true)
+    }
+
+    // ------------------------------------------------------------------ subtitles stored inside the video
+
+    @Volatile private var subScanGen = 0
+
+    /**
+     * Looks for text subtitle tracks inside the video that was just picked (MKV / MP4) and offers them to the page
+     * as an .srt, so the Sentence Index fills without a separate subtitle file. Read-only, runs in the background and
+     * never touches playback; any problem simply means "nothing found".
+     */
+    private fun scanEmbeddedSubs(uri: Uri) {
+        val gen = ++subScanGen
+        val appCtx = act.applicationContext
+        val t = Thread {
+            var res: EmbeddedSubs.Result? = null
+            try {
+                val pfd = appCtx.contentResolver.openFileDescriptor(uri, "r")
+                if (pfd != null) {
+                    ParcelFileDescriptor.AutoCloseInputStream(pfd).use { input ->
+                        res = EmbeddedSubs.scan(input.channel) { gen != subScanGen || released }
+                    }
+                }
+            } catch (e: Throwable) {
+                res = null
+            }
+            val r = res
+            main.post { if (gen == subScanGen && !released) onSubsScanned(r) }
+        }
+        t.isDaemon = true
+        t.priority = Thread.MIN_PRIORITY
+        t.start()
+    }
+
+    private fun onSubsScanned(r: EmbeddedSubs.Result?) {
+        if (r == null) return
+        if (r.tracks.isEmpty()) {
+            // no text track: stay quiet (the page already says to load an .srt), except when the subtitles are pictures
+            if (r.pictureTracks > 0) {
+                Toast.makeText(act.applicationContext, "The subtitles inside this video are pictures and cannot be read. Please load an .srt file.", Toast.LENGTH_LONG).show()
+            }
+            return
+        }
+        val owner = activityProvider()
+        if (r.tracks.size == 1 || owner == null || owner.isFinishing) {
+            deliverSubs(r.tracks[EmbeddedSubs.bestIndex(r.tracks).coerceAtLeast(0)])
+            return
+        }
+        val labels = Array(r.tracks.size) { r.tracks[it].label() + " - " + r.tracks[it].cues.size + " lines" }
+        var sel = EmbeddedSubs.bestIndex(r.tracks).coerceAtLeast(0)
+        AlertDialog.Builder(owner)
+            .setTitle("Subtitles found in this video")
+            .setSingleChoiceItems(labels, sel) { _, which -> sel = which }
+            .setPositiveButton("Load") { _, _ -> deliverSubs(r.tracks[sel]) }
+            .setNegativeButton("Skip", null)
+            .show()
+    }
+
+    private fun deliverSubs(track: EmbeddedSubs.Track) {
+        val srt = EmbeddedSubs.toSrt(track.cues)
+        if (srt.isBlank()) return
+        evalJs(
+            "window.__onEmbeddedSubs&&window.__onEmbeddedSubs(" + JSONObject.quote(track.label()) + "," +
+                JSONObject.quote(srt) + "," + track.cues.size + ")"
+        )
     }
 
     /** The user picked a video with Android's file picker. */
@@ -937,6 +1241,7 @@ class NativeVideo(
         if (persisted) {
             commit(uri, info.first, info.second, stamp, null)
             notifyPage()
+            scanEmbeddedSubs(uri)
         } else {
             startPrivateCopy(uri, info.first, info.second, stamp)
         }
@@ -1026,10 +1331,12 @@ class NativeVideo(
         if (ok) {
             commit(uri, name, dest.length(), stamp, dest)
             notifyPage()
+            scanEmbeddedSubs(Uri.fromFile(dest))
         } else if (canOpen(uri)) {
             commit(uri, name, size, stamp, null)
             Toast.makeText(act.applicationContext, "Could not keep a copy. The video plays now but will not be remembered after you close the app.", Toast.LENGTH_LONG).show()
             notifyPage()
+            scanEmbeddedSubs(uri)
         } else {
             Toast.makeText(act.applicationContext, "Could not read that video file", Toast.LENGTH_LONG).show()
         }
