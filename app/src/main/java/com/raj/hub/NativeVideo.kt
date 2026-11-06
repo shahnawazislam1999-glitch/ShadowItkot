@@ -46,10 +46,20 @@ import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.extractor.DefaultExtractorsFactory
+import androidx.media3.extractor.Extractor
+import androidx.media3.extractor.ExtractorInput
+import androidx.media3.extractor.ExtractorOutput
+import androidx.media3.extractor.ExtractorsFactory
+import androidx.media3.extractor.PositionHolder
+import androidx.media3.extractor.SeekMap
+import androidx.media3.extractor.SniffFailure
+import androidx.media3.extractor.TrackOutput
 import androidx.media3.ui.PlayerView
 import org.json.JSONObject
+import java.io.EOFException
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.util.Locale
 
 /**
@@ -110,6 +120,14 @@ class NativeVideo(
     private var audioList: List<Tracks.Group> = emptyList()
     private var audioPrefApplied = false
     private val audioChip = ImageView(act)
+    private var skippedAudioToastShown = false
+    private var lastWarnMsg = ""
+
+    // automatic recovery after a read error (see tryRecover)
+    private var errRetries = 0
+    private var errRetryAtMs = -1L
+    private var recovering = false
+    private var recoverWantsPlay = false
 
     init {
         panel.visibility = View.GONE
@@ -145,7 +163,7 @@ class NativeVideo(
             .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
             .build()
         val p = ExoPlayer.Builder(act.applicationContext, renderers)
-            .setMediaSourceFactory(DefaultMediaSourceFactory(act.applicationContext, DefaultExtractorsFactory()))
+            .setMediaSourceFactory(DefaultMediaSourceFactory(act.applicationContext, TolerantExtractorsFactory(DefaultExtractorsFactory())))
             .setLoadControl(loadControl)
             .setAudioAttributes(audio, true)
             .setHandleAudioBecomingNoisy(true)
@@ -164,6 +182,7 @@ class NativeVideo(
 
     private val listener = object : Player.Listener {
         override fun onPlaybackStateChanged(playbackState: Int) {
+            if (playbackState == Player.STATE_READY || playbackState == Player.STATE_ENDED) recovering = false
             if ((playbackState == Player.STATE_READY || playbackState == Player.STATE_ENDED) && seekPending) {
                 seekPending = false
                 seekDone++
@@ -198,6 +217,11 @@ class NativeVideo(
         }
 
         override fun onPlayerError(error: PlaybackException) {
+            if (tryRecover(error)) {
+                pushState()
+                return
+            }
+            recovering = false
             val o = JSONObject()
             o.put("e", "err")
             o.put("code", 4)
@@ -219,7 +243,77 @@ class NativeVideo(
         PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED,
         PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED ->
             "the file looks damaged or is not a supported video container"
-        else -> "playback failed (" + e.errorCodeName + ")"
+        else -> "playback failed (" + e.errorCodeName + errorDetail(e) + ")"
+    }
+
+    /** Short technical detail (real cause + where in the video) so a failure can be understood from the screen alone. */
+    private fun errorDetail(e: PlaybackException): String {
+        val sb = StringBuilder()
+        var t: Throwable? = e.cause
+        var depth = 0
+        var root: Throwable? = null
+        while (t != null && depth < 6) {
+            root = t
+            t = t.cause
+            depth++
+        }
+        if (root != null) sb.append(", ").append(root.javaClass.simpleName)
+        val p = exo
+        if (p != null) {
+            val d = p.duration
+            sb.append(", at ").append(fmtMs(p.currentPosition))
+            if (d != C.TIME_UNSET && d > 0L) sb.append(" of ").append(fmtMs(d))
+        }
+        return sb.toString()
+    }
+
+    private fun fmtMs(ms: Long): String {
+        val s = (ms.coerceAtLeast(0L) / 1000L)
+        val h = s / 3600L
+        val m = (s % 3600L) / 60L
+        val sec = s % 60L
+        return if (h > 0L) String.format(Locale.US, "%d:%02d:%02d", h, m, sec) else String.format(Locale.US, "%d:%02d", m, sec)
+    }
+
+    /** Read errors that may well succeed if the same spot is simply opened again. */
+    private fun isRetryable(e: PlaybackException): Boolean = when (e.errorCode) {
+        PlaybackException.ERROR_CODE_IO_UNSPECIFIED,
+        PlaybackException.ERROR_CODE_IO_READ_POSITION_OUT_OF_RANGE,
+        PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED,
+        PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT,
+        PlaybackException.ERROR_CODE_TIMEOUT,
+        PlaybackException.ERROR_CODE_UNSPECIFIED -> true
+        else -> false
+    }
+
+    /**
+     * A read error used to stop everything at once (the page then showed "playback failed"). Now the same spot is
+     * re-opened up to two times first (the second time with a completely fresh source), and the page is told about
+     * the error only if that also fails. Returns true when a retry was started.
+     */
+    private fun tryRecover(error: PlaybackException): Boolean {
+        val p = exo ?: return false
+        if (released || !hasMedia || !isRetryable(error)) return false
+        val pos = p.currentPosition.coerceAtLeast(0L)
+        // an error far from the previous one is a new problem: count from zero again
+        if (errRetryAtMs < 0L || Math.abs(pos - errRetryAtMs) > 5000L) errRetries = 0
+        errRetryAtMs = pos
+        if (errRetries >= 2) return false
+        errRetries++
+        val attempt = errRetries
+        recoverWantsPlay = p.playWhenReady
+        recovering = true
+        val item = p.currentMediaItem
+        // never touch the player from inside its own error callback
+        main.post {
+            val q = exo
+            if (!released && q != null && recovering) {
+                if (attempt >= 2 && item != null) q.setMediaItem(item, q.currentPosition.coerceAtLeast(0L))
+                q.prepare()
+                q.playWhenReady = recoverWantsPlay
+            }
+        }
+        return true
     }
 
     /** Warns (once per video) when the phone has no decoder for the sound or the picture. */
@@ -252,7 +346,8 @@ class NativeVideo(
         if (videoGroups > 0 && !videoOn) {
             msg.append("This phone cannot decode the picture in this file (" + videoNames.joinToString(", ") + "). ")
         }
-        if (msg.isNotEmpty()) {
+        if (msg.isNotEmpty() && msg.toString().trim() != lastWarnMsg) {
+            lastWarnMsg = msg.toString().trim()
             val o = JSONObject()
             o.put("e", "warn")
             o.put("msg", msg.toString().trim())
@@ -293,7 +388,8 @@ class NativeVideo(
         val all = t.groups.filter { it.type == C.TRACK_TYPE_AUDIO && it.length > 0 }
         val list = all.filter { it.isSupported }
         audioList = list
-        if (all.size > list.size && list.isNotEmpty()) {
+        if (all.size > list.size && list.isNotEmpty() && !skippedAudioToastShown) {
+            skippedAudioToastShown = true
             Toast.makeText(act.applicationContext, "Another audio track in this file uses a format this phone cannot play, so it is not listed.", Toast.LENGTH_LONG).show()
         }
         if (list.size < 2) {
@@ -361,14 +457,15 @@ class NativeVideo(
     private fun pushState() {
         val p = exo ?: return
         if (released) return
-        val st = p.playbackState
+        // while a read error is being retried the page just sees normal buffering (no stop, no pause event)
+        val st = if (recovering) Player.STATE_BUFFERING else p.playbackState
         val o = JSONObject()
         o.put("e", "state")
         o.put("q", lastSeq)
         o.put("t", p.currentPosition.coerceAtLeast(0L))
         val d = p.duration
         o.put("d", if (d == C.TIME_UNSET) -1L else d)
-        o.put("pwr", p.playWhenReady && (st == Player.STATE_READY || st == Player.STATE_BUFFERING))
+        o.put("pwr", if (recovering) recoverWantsPlay else (p.playWhenReady && (st == Player.STATE_READY || st == Player.STATE_BUFFERING)))
         o.put("pl", p.isPlaying)
         o.put("st", st)
         o.put("r", p.playbackParameters.speed.toDouble())
@@ -430,12 +527,20 @@ class NativeVideo(
                 }
                 "pause" -> p.pause()
                 "seek" -> {
+                    errRetries = 0
                     seekPending = true
-                    p.seekTo(arg.toLong().coerceAtLeast(0L))
+                    var target = arg.toLong().coerceAtLeast(0L)
+                    // a subtitle time past the end of the file must land on the last moment, not beyond it
+                    val dur = p.duration
+                    if (dur != C.TIME_UNSET && dur > 100L && target >= dur) target = dur - 50L
+                    p.seekTo(target)
                     main.postDelayed({ checkSeek(); pushState() }, 120)
                 }
                 "speed" -> p.setPlaybackSpeed(arg.toFloat().coerceIn(0.25f, 4f))
-                "retry" -> if (p.playbackState == Player.STATE_IDLE && p.currentMediaItem != null) p.prepare()
+                "retry" -> if (p.playbackState == Player.STATE_IDLE && p.currentMediaItem != null) {
+                    errRetries = 0
+                    p.prepare()
+                }
             }
         }
         lastSeq = seq
@@ -692,6 +797,11 @@ class NativeVideo(
             hasMedia = true
             seekPending = false
             audioPrefApplied = false
+            skippedAudioToastShown = false
+            lastWarnMsg = ""
+            errRetries = 0
+            errRetryAtMs = -1L
+            recovering = false
             audioList = emptyList()
             audioChip.visibility = View.GONE
             videoAspect = 16f / 9f
@@ -838,6 +948,7 @@ class NativeVideo(
         }
         loadedKey = null
         hasMedia = false
+        recovering = false
         prefs.edit()
             .remove(key("vid_uri")).remove(key("vid_name")).remove(key("vid_size"))
             .remove(key("vid_stamp")).remove(key("vid_priv")).remove(key("vid_pos"))
@@ -907,5 +1018,78 @@ class TextTileView(ctx: Context) : View(ctx) {
                 }
             }
         }
+    }
+}
+
+/**
+ * Some movie files stop a little before the place their own header says they end (cut, re-muxed or half-copied
+ * files). Android's player then reports a read error ("end of file reached unexpectedly") the moment it gets
+ * there, which would only affect the last sentences of a subtitle file. These two classes turn "the file ended
+ * early" into a normal end of the video, but only after the picture/sound layout and seek table were already
+ * read, so a file that is broken from the start still reports its error as before. Nothing is converted or
+ * re-encoded.
+ */
+@androidx.annotation.OptIn(UnstableApi::class)
+private class TolerantExtractorsFactory(private val base: ExtractorsFactory) : ExtractorsFactory {
+    override fun createExtractors(): Array<Extractor> = wrap(base.createExtractors())
+
+    override fun createExtractors(uri: Uri, responseHeaders: Map<String, List<String>>): Array<Extractor> =
+        wrap(base.createExtractors(uri, responseHeaders))
+
+    private fun wrap(src: Array<Extractor>): Array<Extractor> =
+        Array<Extractor>(src.size) { i -> TolerantExtractor(src[i]) }
+}
+
+@androidx.annotation.OptIn(UnstableApi::class)
+private class TolerantExtractor(private val base: Extractor) : Extractor {
+    private var tracksEnded = false
+    private var seekMapSent = false
+
+    override fun sniff(input: ExtractorInput): Boolean = base.sniff(input)
+
+    override fun getSniffFailureDetails(): List<SniffFailure> = base.getSniffFailureDetails()
+
+    override fun init(output: ExtractorOutput) {
+        tracksEnded = false
+        seekMapSent = false
+        base.init(object : ExtractorOutput {
+            override fun track(id: Int, type: Int): TrackOutput = output.track(id, type)
+
+            override fun endTracks() {
+                tracksEnded = true
+                output.endTracks()
+            }
+
+            override fun seekMap(seekMap: SeekMap) {
+                seekMapSent = true
+                output.seekMap(seekMap)
+            }
+        })
+    }
+
+    override fun read(input: ExtractorInput, seekPosition: PositionHolder): Int {
+        try {
+            return base.read(input, seekPosition)
+        } catch (e: IOException) {
+            if (tracksEnded && seekMapSent && endedEarly(e)) return Extractor.RESULT_END_OF_INPUT
+            throw e
+        }
+    }
+
+    override fun seek(position: Long, timeUs: Long) = base.seek(position, timeUs)
+
+    override fun release() = base.release()
+
+    override fun getUnderlyingImplementation(): Extractor = base.getUnderlyingImplementation()
+
+    private fun endedEarly(e: Throwable): Boolean {
+        var t: Throwable? = e
+        var depth = 0
+        while (t != null && depth < 6) {
+            if (t is EOFException) return true
+            t = t.cause
+            depth++
+        }
+        return false
     }
 }

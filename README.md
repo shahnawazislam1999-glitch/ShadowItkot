@@ -12,7 +12,7 @@ Standalone Android app (Kotlin + WebView). Opens straight into **SHADOWit**, no 
 ## Background play
 
 - Keeps playing with the screen locked, in the background, and after you clear the app from Recents (a notification stays; tap it to come back, or use its Close button).
-- Notification shows the current subtitle with Previous / Pause / Next / Close.
+- Notification shows the current subtitle with Previous / Pause / Next / Floating window on-off / Close (expand it to see all five).
 - Tiny floating subtitle window (tap the text to copy, double-tap to hide that sentence) with Previous / Play-Pause / Next appears whenever the app is not on screen. Drag it by the text.
 - Pen / headset Next and Previous buttons work while minimized or locked (media session). For pen buttons that send Page Up/Down or arrow keys, turn on "Pen buttons when minimized" in the Permission Center (Accessibility).
 - Tip: in Recents, long-press the app card and choose "Keep open" / "Lock" so your phone's own cleaner does not kill it.

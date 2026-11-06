@@ -8,6 +8,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.graphics.drawable.Icon
 import android.media.MediaMetadata
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
@@ -34,6 +35,7 @@ class PlaybackService : Service() {
         private const val ACT_PREV = "com.raj.app.shadowit.PREV"
         private const val ACT_NEXT = "com.raj.app.shadowit.NEXT"
         private const val ACT_CLOSE = "com.raj.app.shadowit.CLOSE"
+        private const val ACT_FLOAT = "com.raj.app.shadowit.FLOAT"
 
         private var inst: PlaybackService? = null
 
@@ -86,6 +88,11 @@ class PlaybackService : Service() {
             ACT_TOGGLE -> host.mediaCmd("toggle")
             ACT_PREV -> host.mediaCmd("prev")
             ACT_NEXT -> host.mediaCmd("next")
+            ACT_FLOAT -> {
+                val sp = getSharedPreferences("rajhub", Context.MODE_PRIVATE)
+                sp.edit().putBoolean("float_on", !sp.getBoolean("float_on", true)).apply()
+                lastSig = ""
+            }
             ACT_CLOSE -> {
                 goForeground()
                 closeAll()
@@ -253,6 +260,11 @@ class PlaybackService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
+    private fun floatOn(): Boolean = getSharedPreferences("rajhub", Context.MODE_PRIVATE).getBoolean("float_on", true)
+
+    private fun act(icon: Int, title: String, pi: PendingIntent): Notification.Action =
+        Notification.Action.Builder(Icon.createWithResource(this, icon), title, pi).build()
+
     private fun buildNotification(): Notification {
         val host = WebHost.current()
         val sub = MediaBus.text.trim()
@@ -274,29 +286,33 @@ class PlaybackService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
-        val b = NotificationCompat.Builder(this, CHANNEL)
+        // Media style: all five buttons show when the notification is expanded (a normal one only shows three).
+        val style = Notification.MediaStyle().setShowActionsInCompactView(0, 1, 2)
+        val tok = session?.sessionToken
+        if (tok != null) style.setMediaSession(tok)
+
+        val b = Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_notify)
             .setContentTitle(title)
             .setContentText(line2)
-            .setStyle(
-                NotificationCompat.BigTextStyle()
-                    .setBigContentTitle(getString(R.string.app_name) + (if (pos.isNotEmpty()) "  ·  $pos" else ""))
-                    .bigText(if (sub.isNotEmpty()) sub else line2)
-            )
+            .setStyle(style)
             .setContentIntent(openPi)
-            .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setCategory(Notification.CATEGORY_TRANSPORT)
+            .setVisibility(Notification.VISIBILITY_PUBLIC)
             .setOnlyAlertOnce(true)
             .setShowWhen(false)
             .setOngoing(playing)
-            .addAction(R.drawable.ic_prev, "Previous", action(ACT_PREV, 1))
+            .addAction(act(R.drawable.ic_prev, "Previous", action(ACT_PREV, 1)))
             .addAction(
-                if (playing) R.drawable.ic_pause else R.drawable.ic_play,
-                if (playing) "Pause" else "Play",
-                action(ACT_TOGGLE, 2)
+                act(
+                    if (playing) R.drawable.ic_pause else R.drawable.ic_play,
+                    if (playing) "Pause" else "Play",
+                    action(ACT_TOGGLE, 2)
+                )
             )
-            .addAction(R.drawable.ic_next, "Next", action(ACT_NEXT, 3))
-            .addAction(R.drawable.ic_close, "Close", action(ACT_CLOSE, 4))
+            .addAction(act(R.drawable.ic_next, "Next", action(ACT_NEXT, 3)))
+            .addAction(act(R.drawable.ic_float, if (floatOn()) "Floating window: on" else "Floating window: off", action(ACT_FLOAT, 5)))
+            .addAction(act(R.drawable.ic_close, "Close", action(ACT_CLOSE, 4)))
         return b.build()
     }
 
@@ -304,7 +320,7 @@ class PlaybackService : Service() {
     fun refresh() {
         syncWakeLock()
 
-        val sig = MediaBus.text + "|" + MediaBus.index + "|" + MediaBus.total + "|" + MediaBus.playing
+        val sig = MediaBus.text + "|" + MediaBus.index + "|" + MediaBus.total + "|" + MediaBus.playing + "|" + floatOn()
         if (sig != lastSig) {
             lastSig = sig
             updateSession()
@@ -317,7 +333,7 @@ class PlaybackService : Service() {
         }
 
         val ov = overlay ?: return
-        if (MediaBus.uiVisible) {
+        if (MediaBus.uiVisible || !floatOn()) {
             ov.hide()
         } else {
             ov.show()
