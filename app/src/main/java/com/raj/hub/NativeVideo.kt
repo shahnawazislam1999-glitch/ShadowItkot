@@ -35,6 +35,7 @@ import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
+import androidx.media3.common.ParserException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.TrackSelectionOverride
@@ -257,7 +258,11 @@ class NativeVideo(
             t = t.cause
             depth++
         }
-        if (root != null) sb.append(", ").append(root.javaClass.simpleName)
+        if (root != null) {
+            sb.append(", ").append(root.javaClass.simpleName)
+            val top = root.stackTrace.firstOrNull()
+            if (top != null) sb.append(" @").append(top.className.substringAfterLast('.')).append('.').append(top.methodName).append(':').append(top.lineNumber)
+        }
         val p = exo
         if (p != null) {
             val d = p.duration
@@ -1071,7 +1076,11 @@ private class TolerantExtractor(private val base: Extractor) : Extractor {
         try {
             return base.read(input, seekPosition)
         } catch (e: IOException) {
-            if (tracksEnded && seekMapSent && endedEarly(e)) return Extractor.RESULT_END_OF_INPUT
+            if (tracksEnded && seekMapSent && (endedEarly(e) || e is ParserException)) return Extractor.RESULT_END_OF_INPUT
+            throw e
+        } catch (e: RuntimeException) {
+            // damaged bytes near the end of the file made the parser throw (e.g. IllegalStateException)
+            if (tracksEnded && seekMapSent) return Extractor.RESULT_END_OF_INPUT
             throw e
         }
     }
