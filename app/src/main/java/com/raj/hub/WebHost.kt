@@ -272,6 +272,7 @@ class WebHost private constructor(val appCtx: Context, val app: AppInfo) {
         )
         column.addView(web, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         nv.relayout()
+        nv.reapplyFullscreen()
         web.onResume()
         web.resumeTimers()
     }
@@ -719,6 +720,12 @@ class WebHost private constructor(val appCtx: Context, val app: AppInfo) {
         fun nvCmd(seq: Double, op: String?, arg: Double) {
             val o = op ?: return
             main.post { if (!destroyed) nv.cmd(seq.toInt(), o, arg) }
+        }
+
+        /** Toggles the video's landscape full screen (video on top, the page's subtitle line below it). */
+        @JavascriptInterface
+        fun nvFullscreen(on: Boolean) {
+            main.post { if (!destroyed) nv.setFullscreenFromPage(on) }
         }
 
         @JavascriptInterface

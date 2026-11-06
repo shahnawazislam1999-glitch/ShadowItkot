@@ -108,6 +108,8 @@ class NativeVideo(
     private var tickCount = 0
     private var copyGen = 0
 
+    private val FS_VIDEO_FRACTION = 0.70f   // share of the (landscape) screen height the video gets in full screen
+
     private var videoAspect = 16f / 9f
     private var insetL = 0
     private var insetT = 0
@@ -634,7 +636,10 @@ class NativeVideo(
         val dm = act.resources.displayMetrics
         val newH: Int
         if (fullscreen) {
-            newH = ViewGroup.LayoutParams.MATCH_PARENT
+            // Landscape full screen: the video takes the top part, the page (subtitles only) stays visible below it.
+            // Uses the short side of the screen so the height is right before and after the rotation finishes.
+            val shortSide = minOf(dm.widthPixels, dm.heightPixels)
+            newH = (shortSide * FS_VIDEO_FRACTION).toInt().coerceAtLeast(dp(96))
         } else {
             val availW = (dm.widthPixels - insetL - insetR).coerceAtLeast(1)
             val maxH = maxOf(dp(96), (dm.heightPixels * 0.4f).toInt())
@@ -654,12 +659,39 @@ class NativeVideo(
         if (show) relayout()
     }
 
+    /** Called by the page's video full screen button (and by the player's own full screen button). */
+    fun setFullscreenFromPage(on: Boolean) {
+        setFullscreen(on)
+    }
+
     private fun setFullscreen(on: Boolean) {
-        if (on == fullscreen) return
+        if (on && !(hasMedia && panel.visibility == View.VISIBLE)) {
+            // nothing to show full screen: make sure the page knows it is off
+            notifyFullscreen(false)
+            return
+        }
+        if (on == fullscreen) {
+            notifyFullscreen(on)   // keeps a reloaded page in step
+            return
+        }
         fullscreen = on
-        web.visibility = if (on) View.GONE else View.VISIBLE
+        // The page stays visible below the video: it shows only the subtitle line while full screen (see the page's nv-vfs mode).
+        web.visibility = View.VISIBLE
         activityProvider()?.requestedOrientation = if (on) ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE else ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         relayout()
+        notifyFullscreen(on)
+    }
+
+    /** The screen was recreated (rotation lock, Recents, ...) while full screen: put the orientation back and tell the page again. */
+    fun reapplyFullscreen() {
+        if (!fullscreen) return
+        activityProvider()?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        relayout()
+        notifyFullscreen(true)
+    }
+
+    private fun notifyFullscreen(on: Boolean) {
+        evalJs("window.__onNvFullscreen&&window.__onNvFullscreen(" + (if (on) "true" else "false") + ")")
     }
 
     /** Back button: leaves full screen first. Returns true when it was used. */
@@ -824,6 +856,7 @@ class NativeVideo(
         applyVisibility()
         relayout()
         pushState()
+        if (fullscreen) notifyFullscreen(true)
     }
 
     /** The user picked a video with Android's file picker. */
