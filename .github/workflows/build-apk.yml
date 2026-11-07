@@ -1,4 +1,4 @@
-name: Build SHADOWit APK
+name: Build ShadowPlayer APK
 
 on:
   push:
@@ -40,19 +40,19 @@ jobs:
       - name: Collect APK
         run: |
           mkdir -p dist
-          cp app/build/outputs/apk/release/app-release.apk dist/SHADOWit.apk
+          cp app/build/outputs/apk/release/app-release.apk dist/ShadowPlayer.apk
           ls -la dist
 
       - name: Upload APK (Actions artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: ShadowIt-apk
-          path: dist/SHADOWit.apk
+          name: ShadowPlayer-apk
+          path: dist/ShadowPlayer.apk
 
       - name: Publish APK to the "latest" release
         run: |
           gh release delete latest --cleanup-tag --yes || true
-          gh release create latest dist/SHADOWit.apk \
-            --title "SHADOWit (latest build)" \
-            --notes "Latest signed APK. Download SHADOWit.apk and install it on your phone." \
+          gh release create latest dist/ShadowPlayer.apk \
+            --title "ShadowPlayer (latest build)" \
+            --notes "Latest signed APK. Download ShadowPlayer.apk and install it on your phone." \
             --latest

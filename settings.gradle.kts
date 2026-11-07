@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "ShadowIt"
+rootProject.name = "ShadowPlayer"
 include(":app")
