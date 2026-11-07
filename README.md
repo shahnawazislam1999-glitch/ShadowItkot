@@ -18,7 +18,15 @@ Standalone Android app (Kotlin + WebView). Opens straight into **SHADOWit**, no 
   - **Press and slide left / right**: the video moves backward / forward (a finger across the whole screen = 2 minutes; change `FS_SWIPE_FULL_WIDTH_MS` in `NativeVideo.kt`). When you let go, the sentence player continues from that place.
 - Position bar: slide with your finger, the picture follows. (The volume bar was removed; use the phone's volume keys.)
 - Button strip (top right, slides sideways, 5 icons visible at a time): Previous, Play/Pause, Next, **Unlink** (film plays normally, no sentence repeat; tap again to go back), **Hide subtitle**, then slide for: **Bookmark** this subtitle, **Audio track**, **Repeat** (how many times every sentence repeats, or this sentence only; the number on the icon is the current count) **Favorite** (star) and **Second subtitle** on / off (translated SRT; the line shows right below the main subtitle).
-- **3-dot button** (top right) opens a menu: **Delay sentence** = pause between sentences in seconds (the same setting as Delay in the page).
+- More icons at the end of the strip (slide further): **Copy** the subtitle, **Edit** it, **Delete** it (asks first), **Subtitles on / off** (hides the text on the picture, nothing else changes), **Jump** to a subtitle number, **Landscape / Portrait** (icon shows the current mode; in portrait the subtitle sits under the picture) and **Lock**.
+- **Lock**: hides every control and turns all gestures off, so only the picture and the subtitle remain. Tap the screen once to show an unlock button for a moment, tap it to unlock. Back does not leave full screen while locked. Full screen always starts unlocked.
+- **Slide up / down** on the picture: **left half = brightness, right half = volume** (a small read-out shows the level). Brightness is remembered for the next full screen and the phone's own brightness returns when you leave full screen.
+- **3-dot button** (top right) opens a menu:
+  - **Delay sentence** = pause between sentences in seconds (the same setting as Delay in the page).
+  - **Upload subtitles / Upload translated subtitles**: pick the .srt files without leaving full screen.
+  - **Words** (e.g. `5` or `5-8`) and **Range** (e.g. `1-5`): the same filters as the page. Range also has Pin range, Pinned ranges, Hide / show range and Delete range (no translate button).
+  - **Starred subtitles** (tap = jump, hold = remove) and **Bulk delete**.
+  - Edit, Delete and Jump pause the film while their box is open.
 - Full screen always starts in normal repeat mode with the controls hidden.
 
 ## Background play

@@ -408,6 +408,7 @@ class WebHost private constructor(val appCtx: Context, val app: AppInfo) {
 
   function snap() {
     flags();
+    pushFilters();
     try {
       var total = 0, idx = 0, text = '', pl = false;
       if (free && typeof sentences !== 'undefined' && sentences && sentences.length) {
@@ -441,6 +442,253 @@ class WebHost private constructor(val appCtx: Context, val app: AppInfo) {
     } catch (e) {}
   }
 
+  // ======================================================================================
+  // [FS_TOOLS] full screen tools: edit / delete / jump / upload subtitles / words filter / range / starred / bulk delete.
+  // The native full screen buttons call these. Everything reuses the page's own functions and storage.
+  // ======================================================================================
+  function toast(m) { try { if (typeof B.nvToast === 'function') B.nvToast(String(m)); } catch (e) {} }
+  function sendData(kind, obj) { try { if (typeof B.nvData === 'function') B.nvData(kind, JSON.stringify(obj)); } catch (e) {} }
+
+  // index (0 based) of the subtitle the learner is on right now (works in normal and free play), or -1
+  function curIx() {
+    try {
+      var ix = (free && freeIdx >= 0) ? freeIdx : sentenceIndex;
+      if (typeof ix !== 'number' || ix < 0 || !sentences || ix >= sentences.length) return -1;
+      return ix;
+    } catch (e) { return -1; }
+  }
+
+  function sendCur(kind) {
+    var ix = curIx();
+    if (ix < 0) { toast('No subtitle loaded yet'); return; }
+    sendData(kind, { i: ix, t: String(sentences[ix] || '') });
+  }
+
+  // words filter + range text, so the full screen dialogs can show the current values
+  var lastFilters = '';
+  function pushFilters() {
+    try {
+      var w = byId('minWordsInput'), r = byId('rangeInput');
+      var o = { words: w ? String(w.value || '').trim() : '', range: r ? String(r.value || '').trim() : '' };
+      var k = o.words + '|' + o.range;
+      if (k === lastFilters) return;
+      lastFilters = k;
+      sendData('filters', o);
+    } catch (e) {}
+  }
+
+  // edit button: same as the page's pencil button (changes the text and saves it into the stored SRT), without prompt()
+  function editSentence(ix, text) {
+    try {
+      text = String(text || '').replace(/\s+/g, ' ').trim();
+      if (!text || !sentences || !(ix >= 0) || ix >= sentences.length || text === sentences[ix]) return;
+      sentences[ix] = text;
+      if (isVideoMode && videoSubtitles && videoSubtitles[ix]) {
+        videoSubtitles[ix].text = text;
+        try { saveToDB('srt', serializeSRTSubtitles(videoSubtitles)); } catch (e) {}
+      }
+      try { renderPlaylist(); } catch (e) {}
+      try { if (!isPlaying) updateScreenOnly(); } catch (e) {}
+      try { if (free && ix === freeIdx) showFreeSentence(ix); } catch (e) {}
+      toast('Subtitle ' + (ix + 1) + ' updated');
+    } catch (e) {}
+    setTimeout(snap, 60);
+    setTimeout(snap, 450);
+  }
+
+  // delete button: the page's permanent delete. The app already asked "Delete?", so the page's own question is answered yes.
+  function delSentence(ix) {
+    var oc = window.confirm;
+    try {
+      if (!sentences || !(ix >= 0) || ix >= sentences.length) return;
+      window.confirm = function () { return true; };
+      deleteSentencePermanently(ix);
+      toast('Subtitle deleted');
+    } catch (e) {
+    } finally {
+      window.confirm = oc;
+    }
+    if (free) freeIdx = -2;
+    setTimeout(snap, 60);
+    setTimeout(snap, 450);
+  }
+
+  // jump button: same rules as the page's "No." box (hidden / filtered subtitles cannot be played)
+  function jumpTo(n) {
+    try {
+      var ix = n - 1;
+      var total = (sentences && sentences.length) ? sentences.length : 0;
+      if (!total || !(ix >= 0 && ix < total)) { toast('Enter a number from 1 to ' + total); return; }
+      updateVisibilityStates();
+      if (!isPlayable(ix)) { toast('Subtitle ' + n + ' is hidden or outside the range / words filter'); return; }
+      if (free) {
+        seekToSub(ix); freeIdx = -2;
+        try { var pr = videoPlayer.play(); if (pr && pr.catch) pr.catch(function () {}); } catch (e) {}
+      } else { isPlaying = true; jumpToSpecificSentence(ix); }
+    } catch (e) {}
+    setTimeout(snap, 60);
+    setTimeout(snap, 450);
+  }
+
+  function setWords(v) {
+    try {
+      v = String(v || '').replace(/\s+/g, '');
+      setInput('minWordsInput', v);
+      toast(v ? ('Words filter: ' + v) : 'Words filter off');
+    } catch (e) {}
+    setTimeout(snap, 60);
+  }
+
+  function setRange(v) {
+    try {
+      v = String(v || '').replace(/\s+/g, '');
+      setInput('rangeInput', v);
+      if (v && sentences && sentences.length) {
+        updateVisibilityStates();
+        var f = getFirstPlayableIndex();
+        if (f !== -1) {
+          if (free) { seekToSub(f); freeIdx = -2; }
+          else jumpToSpecificSentence(f);
+        }
+        toast('Range ' + v);
+      } else {
+        toast('Range cleared');
+      }
+    } catch (e) {}
+    setTimeout(snap, 60);
+    setTimeout(snap, 450);
+  }
+
+  // sets the page's Range box only (no jump), used before pin / hide / delete range
+  function rangeQuiet(v) {
+    try { setInput('rangeInput', String(v || '').replace(/\s+/g, '')); } catch (e) {}
+  }
+
+  function rangeValue() { var r = byId('rangeInput'); return r ? String(r.value || '').trim() : ''; }
+
+  function rangePin() {
+    try {
+      var v = rangeValue();
+      if (!v) { toast('Enter a range first'); return; }
+      if (typeof isValidRangeFormat === 'function' && !isValidRangeFormat(v)) { toast('Use a range like 1-5'); return; }
+      addPinnedRange(v);
+      toast('Range ' + v + ' pinned');
+    } catch (e) {}
+  }
+
+  function rangeHide() {
+    try {
+      if (!rangeValue()) { toast('Enter a range first'); return; }
+      var b = byId('globalHideBtn');
+      if (b) b.click();
+    } catch (e) {}
+    setTimeout(snap, 60);
+    setTimeout(snap, 450);
+  }
+
+  function rangeDelete() {
+    try {
+      if (!rangeValue()) { toast('Enter a range first'); return; }
+      var b = byId('globalDeleteRangeBtn');
+      if (b) b.click();      // the page asks "Permanently delete sentences from x to y?" itself
+    } catch (e) {}
+    if (free) freeIdx = -2;
+    setTimeout(snap, 60);
+    setTimeout(snap, 450);
+  }
+
+  function listPinned() {
+    try { sendData('pinned', (typeof pinnedRanges !== 'undefined' && Array.isArray(pinnedRanges)) ? pinnedRanges : []); } catch (e) { sendData('pinned', []); }
+  }
+
+  function playPinned(r) {
+    try {
+      r = String(r || '').trim();
+      if (free) {
+        var n = parseInt(r, 10);
+        setInput('rangeInput', r);
+        updateVisibilityStates();
+        if (n >= 1 && sentences && n <= sentences.length) { seekToSub(n - 1); freeIdx = -2; }
+      } else {
+        playPinnedRange(r);
+      }
+    } catch (e) {}
+    setTimeout(snap, 60);
+    setTimeout(snap, 450);
+  }
+
+  function unpin(r) { try { removePinnedRange(String(r || '').trim()); } catch (e) {} }
+
+  function listStarred() {
+    var out = [];
+    try {
+      for (var i = 0; i < sentences.length; i++) if (starredSentences.has(sentences[i])) out.push([i, String(sentences[i])]);
+    } catch (e) {}
+    sendData('starred', out);
+  }
+
+  function unstar(ix) {
+    try {
+      if (!sentences || !(ix >= 0) || ix >= sentences.length) return;
+      starredSentences.delete(sentences[ix]);
+      localStorage.setItem('app_starred', JSON.stringify(Array.from(starredSentences)));
+      try { updateVisibilityStates(); } catch (e) {}
+      try { updateActiveSentenceToolbar(); } catch (e) {}
+    } catch (e) {}
+    setTimeout(snap, 60);
+  }
+
+  function listSentences() {
+    var out = [];
+    try {
+      for (var i = 0; i < sentences.length; i++) out.push([i, String(sentences[i])]);
+    } catch (e) {}
+    sendData('sentences', out);
+  }
+
+  // bulk delete: fills the page's own bulk-delete selection and presses its button (the page asks "Permanently delete N sentences?")
+  function bulkDelete(arr) {
+    try {
+      if (!sentences || !sentences.length || !arr || !arr.length) return;
+      var before = sentences.length;
+      selectedForDelete.clear();
+      for (var i = 0; i < arr.length; i++) if (arr[i] >= 0 && arr[i] < sentences.length) selectedForDelete.add(arr[i]);
+      if (!selectedForDelete.size) return;
+      isBulkDeleteMode = true;
+      byId('bulkDeleteToggleBtn').click();
+      if (sentences.length !== before) {
+        if (isVideoMode) { try { saveToDB('srt', serializeSRTSubtitles(videoSubtitles)); } catch (e) {} }
+        toast((before - sentences.length) + ' subtitles deleted');
+      }
+    } catch (e) {}
+    if (free) freeIdx = -2;
+    setTimeout(snap, 60);
+    setTimeout(snap, 450);
+  }
+
+  // upload main / translated subtitles picked in the app: handed to the page exactly like a file chosen in its own upload button
+  function loadSrt(kind, name, b64) {
+    try {
+      var bin = atob(b64), u8 = new Uint8Array(bin.length);
+      for (var i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+      var second = (kind === 'second');
+      var input = byId(second ? 'secondSrtUpload' : 'srtUpload');
+      if (!input) return;
+      var f = new File([u8], name || 'subtitles.srt', { type: 'application/x-subrip' });
+      var dt = new DataTransfer();
+      dt.items.add(f);
+      input.files = dt.files;
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      setTimeout(function () {
+        try {
+          if (second) toast(secondSrtSubtitles && secondSrtSubtitles.length ? ('Translated subtitles loaded: ' + secondSrtSubtitles.length + ' lines') : 'Translated subtitles not loaded');
+          else toast(sentences && sentences.length ? ('Subtitles loaded: ' + sentences.length + ' lines') : 'Subtitles not loaded');
+        } catch (e) {}
+      }, 700);
+    } catch (e) { toast('Could not read that subtitle file'); }
+    setTimeout(snap, 800);
+  }
+
   function cmd(c) {
     try {
       if (c === 'unlink:1') { enterFree(); return; }
@@ -458,6 +706,9 @@ class WebHost private constructor(val appCtx: Context, val app: AppInfo) {
       }
       if (c === 'star') { var sb = byId('actStarBtn'); if (sb) sb.click(); setTimeout(snap, 60); return; }
       if (c.indexOf('delay:') === 0 || c.indexOf('repeatAll:') === 0 || c.indexOf('repeatOne:') === 0) { setting(c); return; }
+      if (c === 'edit:get') { sendCur('edit'); return; }
+      if (c === 'del:get') { sendCur('delete'); return; }
+      if (c.indexOf('jump:') === 0) { jumpTo(parseInt(c.slice(5), 10)); return; }
       if (free) {
         if (c === 'toggle') freeToggle();
         else if (c === 'hide') freeHide();
@@ -519,7 +770,13 @@ class WebHost private constructor(val appCtx: Context, val app: AppInfo) {
     }
   } catch (e) {}
 
-  window.__rajMedia = { cmd: cmd, snap: snap, align: align, scrubStart: scrubStart, scrubEnd: scrubEnd };
+  window.__rajMedia = {
+    cmd: cmd, snap: snap, align: align, scrubStart: scrubStart, scrubEnd: scrubEnd,
+    editSentence: editSentence, delSentence: delSentence, setWords: setWords, setRange: setRange, rangeQuiet: rangeQuiet,
+    rangePin: rangePin, rangeHide: rangeHide, rangeDelete: rangeDelete,
+    listPinned: listPinned, playPinned: playPinned, unpin: unpin,
+    listStarred: listStarred, unstar: unstar, listSentences: listSentences, bulkDelete: bulkDelete, loadSrt: loadSrt
+  };
   setInterval(snap, 300);
   setInterval(align, 1500);
   window.addEventListener('resize', align);
@@ -1100,6 +1357,21 @@ class WebHost private constructor(val appCtx: Context, val app: AppInfo) {
         @JavascriptInterface
         fun mediaSub2(text: String?, on: Boolean, has: Boolean) {
             main.post { if (!destroyed) nv.setSub2(text ?: "", on, has) }
+        }
+
+        /** Data the full screen dialogs asked for (current subtitle for edit / delete, starred list, pinned ranges, all sentences, filters). */
+        @JavascriptInterface
+        fun nvData(kind: String?, json: String?) {
+            val k = kind ?: return
+            val j = json ?: return
+            main.post { if (!destroyed) nv.onPageData(k, j) }
+        }
+
+        /** Short message from the page's full screen tools. */
+        @JavascriptInterface
+        fun nvToast(msg: String?) {
+            val m = msg ?: return
+            main.post { if (!destroyed) Toast.makeText(appCtx, m, Toast.LENGTH_SHORT).show() }
         }
 
         @JavascriptInterface

@@ -46,6 +46,20 @@ class AppActivity : AppCompatActivity() {
         }
     }
 
+    // subtitle files picked from the full screen menu (main or translated .srt), see NativeVideo.pickSubtitles
+    private var pendingSubsKind = "main"
+    private val subsPicker = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+        val uri = r.data?.data
+        if (r.resultCode == RESULT_OK && uri != null) {
+            host?.let { it.nv.onSubsPicked(pendingSubsKind, uri) }
+        }
+    }
+
+    fun launchSubsPicker(i: Intent, kind: String) {
+        pendingSubsKind = kind
+        subsPicker.launch(i)
+    }
+
     fun launchChooser(i: Intent) {
         chooser.launch(i)
     }

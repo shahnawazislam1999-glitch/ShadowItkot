@@ -1,6 +1,9 @@
 package com.raj.hub
 
 import android.content.Context
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.DialogInterface
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.ActivityInfo
@@ -13,6 +16,7 @@ import android.graphics.drawable.GradientDrawable
 import android.graphics.Paint
 import android.graphics.RenderEffect
 import android.graphics.Shader
+import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
 import android.os.Handler
@@ -21,6 +25,7 @@ import android.os.SystemClock
 import android.os.ParcelFileDescriptor
 import android.os.StatFs
 import android.provider.OpenableColumns
+import android.provider.Settings
 import android.text.InputType
 import android.text.TextPaint
 import android.view.GestureDetector
@@ -31,11 +36,13 @@ import android.view.TextureView
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.PopupWindow
+import android.widget.ScrollView
 import android.widget.LinearLayout
 import android.widget.ImageView
 import android.widget.TextView
@@ -69,6 +76,7 @@ import androidx.media3.extractor.SeekMap
 import androidx.media3.extractor.SniffFailure
 import androidx.media3.extractor.TrackOutput
 import androidx.media3.ui.PlayerView
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.EOFException
 import java.io.File
@@ -97,6 +105,9 @@ private const val FS_STRIP_VISIBLE = 5
 
 /** Full screen button strip: size of one icon cell in dp. */
 private const val FS_ITEM_DP = 46
+
+/** Full screen: sliding a finger up / down along this fraction of the screen height changes brightness (left half) or volume (right half) from 0 to 100%. */
+private const val FS_ADJUST_SPAN = 0.85f
 
 @androidx.annotation.OptIn(UnstableApi::class)
 class NativeVideo(
@@ -159,6 +170,37 @@ class NativeVideo(
     // [FS_MORE] three dots (top right) -> small menu (Delay sentence)
     private val fsMore = ImageView(act)
     private var morePopup: PopupWindow? = null
+
+    // [FS_TOOLS] more strip buttons: copy / edit / delete subtitle, subtitles on-off, jump, landscape-portrait, lock
+    private val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
+    private val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
+    private val fsCopy = ImageView(act)
+    private val fsEdit = ImageView(act)
+    private val fsDelete = ImageView(act)
+    private val fsSubsToggle = ImageView(act)
+    private val fsJump = ImageView(act)
+    private val fsOrient = ImageView(act)
+    private val fsLock = ImageView(act)
+    private var subsVisible = prefs.getBoolean("fs_subs_on", true)   // subtitles drawn on the picture (on / off toggle)
+    private var fsPortrait = prefs.getBoolean("fs_portrait", false)  // full screen in portrait instead of landscape
+    private var locked = false                                       // lock: no gesture, no controls, only picture + subtitle
+    private val unlockBtn = ImageView(act)
+    private val unlockHide = Runnable { unlockBtn.visibility = View.GONE }
+    // slide up / down: left half = brightness, right half = volume (small read-out on the picture)
+    private val hudBox = LinearLayout(act)
+    private val hudIcon = ImageView(act)
+    private val hudFill = View(act)
+    private val hudText = TextView(act)
+    private val hudHide = Runnable { hudBox.visibility = View.GONE }
+    private var adjMode = 0               // 0 = none, 1 = brightness, 2 = volume
+    private var adjStartY = 0f
+    private var adjStartLevel = 0f
+    private var adjLevel = 0f
+    // what the page has in its Words and Range boxes (the page sends it), shown in the 3-dot menu and its dialogs
+    private var filterWords = ""
+    private var filterRange = ""
+    // playback is paused while an edit / delete / jump dialog is open and resumes afterwards
+    private var resumeAfterDialog = false
 
     // state of the current sentence, sent by the page (see setFlags)
     private var flagStar = false
@@ -291,7 +333,22 @@ class NativeVideo(
         fsStar.contentDescription = "Add this subtitle to favorites"
         fsSub2.contentDescription = "Second subtitle on / off"
         fsMore.contentDescription = "More"
-        for (b in listOf(fsPrev, fsPlay, fsNext, fsUnlink, fsHide, fsBookmark, fsAudio, fsRepeat, fsStar, fsSub2, fsMore)) {
+        fsCopy.setImageResource(R.drawable.ic_copy)
+        fsEdit.setImageResource(R.drawable.ic_edit)
+        fsDelete.setImageResource(R.drawable.ic_delete)
+        fsSubsToggle.setImageResource(R.drawable.ic_subs_on)
+        fsJump.setImageResource(R.drawable.ic_jump)
+        fsOrient.setImageResource(R.drawable.ic_orient_landscape)
+        fsLock.setImageResource(R.drawable.ic_lock)
+        fsCopy.contentDescription = "Copy this subtitle"
+        fsEdit.contentDescription = "Edit this subtitle"
+        fsDelete.contentDescription = "Delete this subtitle"
+        fsSubsToggle.contentDescription = "Subtitles on / off"
+        fsJump.contentDescription = "Jump to a subtitle number"
+        fsOrient.contentDescription = "Landscape / portrait"
+        fsLock.contentDescription = "Lock the screen"
+        for (b in listOf(fsPrev, fsPlay, fsNext, fsUnlink, fsHide, fsBookmark, fsAudio, fsRepeat, fsStar, fsSub2, fsMore,
+            fsCopy, fsEdit, fsDelete, fsSubsToggle, fsJump, fsOrient, fsLock)) {
             b.alpha = 0.35f
             b.setPadding(dp(11), dp(11), dp(11), dp(11))
         }
@@ -307,7 +364,8 @@ class NativeVideo(
         badgeLp.setMargins(0, 0, dp(5), dp(4))
         fsRepeatWrap.addView(fsRepeatBadge, badgeLp)
         val itemPx = dp(FS_ITEM_DP)
-        for (v in listOf<View>(fsPrev, fsPlay, fsNext, fsUnlink, fsHide, fsBookmark, fsAudio, fsRepeatWrap, fsStar, fsSub2)) {
+        for (v in listOf<View>(fsPrev, fsPlay, fsNext, fsUnlink, fsHide, fsBookmark, fsAudio, fsRepeatWrap, fsStar, fsSub2,
+            fsCopy, fsEdit, fsDelete, fsSubsToggle, fsJump, fsOrient, fsLock)) {
             fsControls.addView(v, LinearLayout.LayoutParams(itemPx, itemPx))
         }
         fsStrip.addView(fsControls, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
@@ -337,6 +395,13 @@ class NativeVideo(
         }
         fsRepeatWrap.setOnClickListener { showRepeatDialog() }
         fsMore.setOnClickListener { showMoreMenu() }
+        fsCopy.setOnClickListener { copySubtitle(); poke() }
+        fsEdit.setOnClickListener { page("cmd('edit:get')"); poke() }
+        fsDelete.setOnClickListener { page("cmd('del:get')"); poke() }
+        fsSubsToggle.setOnClickListener { setSubsVisible(!subsVisible); poke() }
+        fsJump.setOnClickListener { showJumpDialog() }
+        fsOrient.setOnClickListener { setPortrait(!fsPortrait); poke() }
+        fsLock.setOnClickListener { setLocked(true) }
         // keep the controls up while the finger is on the strip (sliding it sideways)
         fsStrip.setOnTouchListener { _, e ->
             if (e.actionMasked == MotionEvent.ACTION_DOWN) main.removeCallbacks(hideRunnable)
@@ -384,6 +449,53 @@ class NativeVideo(
             poke()
         }
         panel.addView(seekBar, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52), Gravity.BOTTOM))
+
+        // [FS_LOCK] unlock button: only shows for a moment after a tap while the screen is locked
+        unlockBtn.setImageResource(R.drawable.ic_lock_open)
+        unlockBtn.setPadding(dp(14), dp(14), dp(14), dp(14))
+        unlockBtn.background = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(Color.argb(170, 0, 0, 0))
+        }
+        unlockBtn.contentDescription = "Unlock the screen"
+        unlockBtn.visibility = View.GONE
+        unlockBtn.setOnClickListener { setLocked(false) }
+        val unlockLp = FrameLayout.LayoutParams(dp(56), dp(56), Gravity.CENTER_VERTICAL or Gravity.END)
+        unlockLp.setMargins(0, 0, dp(28), 0)
+        panel.addView(unlockBtn, unlockLp)
+
+        // [FS_ADJUST] small read-out while sliding for brightness / volume (touches pass through)
+        hudBox.orientation = LinearLayout.HORIZONTAL
+        hudBox.gravity = Gravity.CENTER_VERTICAL
+        hudBox.setPadding(dp(14), dp(10), dp(16), dp(10))
+        hudBox.background = GradientDrawable().apply {
+            setColor(Color.argb(175, 0, 0, 0))
+            cornerRadius = dp(22).toFloat()
+        }
+        hudIcon.setImageResource(R.drawable.ic_volume)
+        hudBox.addView(hudIcon, LinearLayout.LayoutParams(dp(22), dp(22)))
+        val hudTrack = FrameLayout(act)
+        hudTrack.background = GradientDrawable().apply {
+            setColor(Color.argb(80, 255, 255, 255))
+            cornerRadius = dp(3).toFloat()
+        }
+        hudFill.background = GradientDrawable().apply {
+            setColor(Color.WHITE)
+            cornerRadius = dp(3).toFloat()
+        }
+        hudTrack.addView(hudFill, FrameLayout.LayoutParams(0, MATCH, Gravity.START))
+        val trackLp = LinearLayout.LayoutParams(dp(120), dp(5))
+        trackLp.setMargins(dp(10), 0, dp(10), 0)
+        hudBox.addView(hudTrack, trackLp)
+        hudText.setTextColor(Color.WHITE)
+        hudText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+        hudText.setTypeface(hudText.typeface, android.graphics.Typeface.BOLD)
+        hudText.minWidth = dp(40)
+        hudBox.addView(hudText, LinearLayout.LayoutParams(WRAP, WRAP))
+        hudBox.visibility = View.GONE
+        val hudLp = FrameLayout.LayoutParams(WRAP, WRAP, Gravity.TOP or Gravity.CENTER_HORIZONTAL)
+        hudLp.setMargins(0, dp(26), 0, 0)
+        panel.addView(hudBox, hudLp)
 
         playerView.setFullscreenButtonClickListener { setFullscreen(!fullscreen) }
         playerView.subtitleView?.visibility = View.GONE
@@ -904,12 +1016,23 @@ class NativeVideo(
         subtitleText.setTextSize(TypedValue.COMPLEX_UNIT_PX, shortSide * 0.055f)
         sub2Text.setTextSize(TypedValue.COMPLEX_UNIT_PX, shortSide * 0.045f)
         val lp = subBox.layoutParams as FrameLayout.LayoutParams
-        val side = maxOf(dp(24), (maxOf(dm.widthPixels, dm.heightPixels) * 0.12f).toInt())
-        // subtitle sits above the position bar, which is at the very bottom
-        lp.setMargins(side, 0, side, dp(38) + (shortSide * 0.03f).toInt())
+        if (dm.heightPixels > dm.widthPixels) {
+            // portrait: the subtitle sits right under the picture, which is centred on the screen
+            val sidePortrait = maxOf(dp(16), (dm.widthPixels * 0.05f).toInt())
+            val contentW = (dm.widthPixels - insetL - insetR).coerceAtLeast(1)
+            val contentH = (dm.heightPixels - insetT).coerceAtLeast(1)
+            val videoH = minOf(contentW / videoAspect, contentH.toFloat())
+            val top = insetT + ((contentH + videoH) / 2f).toInt() + dp(14)
+            lp.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            lp.setMargins(sidePortrait, top, sidePortrait, 0)
+        } else {
+            val side = maxOf(dp(24), (maxOf(dm.widthPixels, dm.heightPixels) * 0.12f).toInt())
+            // subtitle sits above the position bar, which is at the very bottom
+            lp.gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            lp.setMargins(side, 0, side, dp(38) + (shortSide * 0.03f).toInt())
+        }
         subBox.layoutParams = lp
-        applySub2()
-        subtitleText.visibility = if (fullscreen && subtitleText.text.isNotEmpty()) View.VISIBLE else View.GONE
+        syncSubtitleViews()
         // position bar at the bottom edge, below the subtitle (full width: the button strip is at the top now)
         val slp = seekBar.layoutParams as FrameLayout.LayoutParams
         slp.setMargins(dp(14), 0, dp(14), dp(6))
@@ -940,20 +1063,37 @@ class NativeVideo(
             override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
                 // a long press that ends without sliding is not a tap
                 if (upAt - downAt > longPressMs) return false
+                if (locked) {
+                    // locked: a tap only shows the unlock button for a moment
+                    showUnlockBtn()
+                    return true
+                }
                 onFsSingleTap(e.x)
                 return true
             }
 
             override fun onDoubleTap(e: MotionEvent): Boolean {
+                if (locked) return true
                 onFsDoubleTap()
                 return true
             }
 
             override fun onScroll(e1: MotionEvent?, e2: MotionEvent, distanceX: Float, distanceY: Float): Boolean {
-                if (e1 == null || !fullscreen) return false
+                if (e1 == null || !fullscreen || locked) return false
                 val dx = e2.x - e1.x
                 val dy = e2.y - e1.y
+                // already sliding for brightness / volume
+                if (adjMode != 0) {
+                    updateAdjust(e2.y)
+                    return true
+                }
                 if (!swiping) {
+                    // a clearly vertical slide: left half = brightness, right half = volume
+                    if (Math.abs(dy) >= slop * 2 && Math.abs(dy) > Math.abs(dx) * 1.2f) {
+                        startAdjust(e1.x, e1.y)
+                        updateAdjust(e2.y)
+                        return true
+                    }
                     // start only for a clearly horizontal slide, so a shaky tap is never taken for a slide
                     if (Math.abs(dx) < slop * 2 || Math.abs(dx) < Math.abs(dy) * 1.2f) return false
                     startSwipe()
@@ -970,13 +1110,14 @@ class NativeVideo(
             detector.onTouchEvent(e)
             if (e.actionMasked == MotionEvent.ACTION_UP || e.actionMasked == MotionEvent.ACTION_CANCEL) {
                 if (swiping) endSwipe()
+                if (adjMode != 0) endAdjust()
             }
             true
         }
     }
 
     private fun onFsSingleTap(x: Float) {
-        if (!fullscreen) return
+        if (!fullscreen || locked) return
         val w = tapLayer.width.toFloat().coerceAtLeast(1f)
         val cmd = when {
             x < w * FS_SIDE_ZONE -> "prev"
@@ -988,7 +1129,7 @@ class NativeVideo(
     }
 
     private fun onFsDoubleTap() {
-        if (!fullscreen) return
+        if (!fullscreen || locked) return
         if (uiPinned) {
             uiPinned = false
             hideFsUi()
@@ -1045,7 +1186,7 @@ class NativeVideo(
     }
 
     private fun showFsUi() {
-        if (!fullscreen) return
+        if (!fullscreen || locked) return
         fsUiVisible = true
         applyFsUi()
         refreshSliders()
@@ -1099,7 +1240,7 @@ class NativeVideo(
 
     /** One place decides what is visible: normal screen = as before; full screen = only picture + subtitle until tapped. */
     private fun applyFsUi() {
-        val show = fullscreen && fsUiVisible
+        val show = fullscreen && fsUiVisible && !locked
         tapLayer.visibility = if (fullscreen) View.VISIBLE else View.GONE
         fade(fsStrip, show)
         fade(fsMore, show)
@@ -1124,6 +1265,601 @@ class NativeVideo(
                 seekBar.setLabels(fmtMs(pos), fmtMs(dur))
             }
         }
+    }
+
+    // ------------------------------------------------------------------ [FS_TOOLS] copy / edit / delete / jump / lock / orientation / brightness + volume
+
+    private fun toastShort(msg: String) {
+        Toast.makeText(act.applicationContext, msg, Toast.LENGTH_SHORT).show()
+    }
+
+    /** Calls a function of the page's media hook (see MEDIA_HOOK_JS in WebHost.kt). */
+    private fun page(call: String) {
+        evalJs("window.__rajMedia&&window.__rajMedia." + call)
+    }
+
+    private fun dialogOwner(): AppCompatActivity? {
+        val a = activityProvider() ?: return null
+        return if (a.isFinishing) null else a
+    }
+
+    private fun shorten(t: String): String = if (t.length > 90) t.substring(0, 90) + "\u2026" else t
+
+    // ---- copy
+
+    private fun copySubtitle() {
+        val t = subtitleText.text.toString().trim()
+        if (t.isEmpty()) {
+            toastShort("No subtitle to copy")
+            return
+        }
+        try {
+            val cm = act.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("subtitle", t))
+            toastShort("Subtitle copied")
+        } catch (e: Exception) {
+            toastShort("Could not copy")
+        }
+    }
+
+    // ---- subtitles on / off
+
+    private fun setSubsVisible(on: Boolean) {
+        subsVisible = on
+        prefs.edit().putBoolean("fs_subs_on", on).apply()
+        syncSubtitleViews()
+        updateFlagUi()
+        toastShort(if (on) "Subtitles on" else "Subtitles off")
+    }
+
+    // ---- landscape / portrait
+
+    private fun fsOrientation(): Int =
+        if (fsPortrait) ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT else ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+
+    private fun setPortrait(on: Boolean) {
+        fsPortrait = on
+        prefs.edit().putBoolean("fs_portrait", on).apply()
+        if (fullscreen) activityProvider()?.requestedOrientation = fsOrientation()
+        updateFlagUi()
+        relayout()
+    }
+
+    // ---- lock
+
+    private fun setLocked(on: Boolean) {
+        if (on && !fullscreen) return
+        locked = on
+        main.removeCallbacks(unlockHide)
+        unlockBtn.visibility = View.GONE
+        if (on) {
+            uiPinned = false
+            fsUiVisible = false
+            main.removeCallbacks(hideRunnable)
+            main.removeCallbacks(uiTick)
+            morePopup?.dismiss()
+            applyFsUi()
+            toastShort("Screen locked. Tap the screen to show the unlock button.")
+        } else {
+            applyFsUi()
+            toastShort("Screen unlocked")
+            showFsUi()
+        }
+    }
+
+    private fun showUnlockBtn() {
+        main.removeCallbacks(unlockHide)
+        unlockBtn.alpha = 1f
+        unlockBtn.visibility = View.VISIBLE
+        main.postDelayed(unlockHide, 2500)
+    }
+
+    // ---- brightness (left half) and volume (right half): slide up / down
+
+    private fun currentBrightness(): Float {
+        val cur = activityProvider()?.window?.attributes?.screenBrightness ?: -1f
+        if (cur >= 0f) return cur
+        return try {
+            Settings.System.getInt(act.contentResolver, Settings.System.SCREEN_BRIGHTNESS) / 255f
+        } catch (e: Exception) {
+            0.5f
+        }
+    }
+
+    private fun applyBrightness(level: Float): Float {
+        val v = level.coerceIn(0.02f, 1f)
+        val a = activityProvider() ?: return v
+        val lp = a.window.attributes
+        lp.screenBrightness = v
+        a.window.attributes = lp
+        return v
+    }
+
+    /** Full screen starts with the brightness the learner chose last time (if any); leaving it gives the phone's own brightness back. */
+    private fun applyScreenBrightness(on: Boolean) {
+        val a = activityProvider() ?: return
+        val lp = a.window.attributes
+        val saved = prefs.getFloat("fs_bright", -1f)
+        lp.screenBrightness = if (on && saved >= 0f) saved.coerceIn(0.02f, 1f) else WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+        a.window.attributes = lp
+    }
+
+    private fun audioManager(): AudioManager = act.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+    private fun currentVolume(): Float {
+        return try {
+            val am = audioManager()
+            val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+            am.getStreamVolume(AudioManager.STREAM_MUSIC).toFloat() / max
+        } catch (e: Exception) {
+            0.5f
+        }
+    }
+
+    private fun applyVolume(level: Float) {
+        try {
+            val am = audioManager()
+            val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+            am.setStreamVolume(AudioManager.STREAM_MUSIC, Math.round(level * max).coerceIn(0, max), 0)
+        } catch (e: Exception) {
+            // some phones refuse (Do Not Disturb rules): the hardware keys still work
+        }
+    }
+
+    private fun startAdjust(x: Float, y: Float) {
+        val w = tapLayer.width.toFloat().coerceAtLeast(1f)
+        adjMode = if (x < w / 2f) 1 else 2
+        adjStartY = y
+        adjStartLevel = if (adjMode == 1) currentBrightness() else currentVolume()
+        adjLevel = adjStartLevel
+        main.removeCallbacks(hudHide)
+    }
+
+    private fun updateAdjust(y: Float) {
+        val h = tapLayer.height.toFloat().coerceAtLeast(1f)
+        val level = (adjStartLevel + (adjStartY - y) / (h * FS_ADJUST_SPAN)).coerceIn(0f, 1f)
+        if (adjMode == 1) {
+            adjLevel = applyBrightness(level)
+        } else {
+            adjLevel = level
+            applyVolume(level)
+        }
+        showHud(adjMode == 1, adjLevel)
+    }
+
+    private fun endAdjust() {
+        if (adjMode == 1) prefs.edit().putFloat("fs_bright", adjLevel).apply()
+        adjMode = 0
+        main.removeCallbacks(hudHide)
+        main.postDelayed(hudHide, 700)
+    }
+
+    private fun showHud(brightness: Boolean, level: Float) {
+        hudIcon.setImageResource(if (brightness) R.drawable.ic_brightness else R.drawable.ic_volume)
+        hudText.text = Math.round(level * 100f).toString() + "%"
+        val lp = hudFill.layoutParams
+        lp.width = (dp(120) * level).toInt()
+        hudFill.layoutParams = lp
+        main.removeCallbacks(hudHide)
+        hudBox.visibility = View.VISIBLE
+    }
+
+    // ---- answers from the page (see nvData in WebHost.kt)
+
+    fun onPageData(kind: String, json: String) {
+        if (released) return
+        try {
+            when (kind) {
+                "filters" -> {
+                    val o = JSONObject(json)
+                    filterWords = o.optString("words", "")
+                    filterRange = o.optString("range", "")
+                }
+                "edit" -> showEditDialog(JSONObject(json))
+                "delete" -> showDeleteDialog(JSONObject(json))
+                "starred" -> showStarredDialog(JSONArray(json))
+                "pinned" -> showPinnedDialog(JSONArray(json))
+                "sentences" -> showBulkDeleteDialog(JSONArray(json))
+            }
+        } catch (e: Exception) {
+            // unreadable answer: ignore
+        }
+    }
+
+    // ---- pause the film while an edit / delete / jump dialog is open
+
+    private fun holdPlayback() {
+        main.removeCallbacks(hideRunnable)
+        resumeAfterDialog = MediaBus.playing
+        if (resumeAfterDialog) page("cmd('toggle')")
+    }
+
+    private fun resumePlaybackNow() {
+        if (!resumeAfterDialog) return
+        resumeAfterDialog = false
+        page("cmd('toggle')")
+    }
+
+    private fun dialogClosed() {
+        resumePlaybackNow()
+        poke()
+    }
+
+    // ---- edit
+
+    private fun showEditDialog(o: JSONObject) {
+        val ownerAct = dialogOwner() ?: return
+        val ix = o.optInt("i", -1)
+        val text = o.optString("t", "")
+        if (ix < 0) return
+        holdPlayback()
+        val input = EditText(ownerAct)
+        input.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+        input.setText(text)
+        input.setSelection(input.text.length)
+        input.minLines = 2
+        input.maxLines = 5
+        input.gravity = Gravity.TOP or Gravity.START
+        val holder = FrameLayout(ownerAct)
+        holder.setPadding(dp(22), dp(8), dp(22), 0)
+        holder.addView(input, FrameLayout.LayoutParams(MATCH, WRAP))
+        val d = AlertDialog.Builder(ownerAct)
+            .setTitle("Edit subtitle " + (ix + 1))
+            .setView(holder)
+            .setPositiveButton("Save") { _, _ ->
+                val t = input.text.toString().replace(Regex("\\s+"), " ").trim()
+                if (t.isNotEmpty() && t != text) {
+                    page("editSentence(" + ix + "," + JSONObject.quote(t) + ")")
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .setOnDismissListener { dialogClosed() }
+            .create()
+        d.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE or WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        d.show()
+    }
+
+    // ---- delete
+
+    private fun showDeleteDialog(o: JSONObject) {
+        val ownerAct = dialogOwner() ?: return
+        val ix = o.optInt("i", -1)
+        val text = o.optString("t", "")
+        if (ix < 0) return
+        holdPlayback()
+        AlertDialog.Builder(ownerAct)
+            .setTitle("Delete subtitle " + (ix + 1) + "?")
+            .setMessage(text + "\n\nThis removes it from your subtitle list for good.")
+            .setPositiveButton("Delete") { _, _ ->
+                resumePlaybackNow()
+                page("delSentence(" + ix + ")")
+            }
+            .setNegativeButton("Cancel", null)
+            .setOnDismissListener { dialogClosed() }
+            .show()
+    }
+
+    // ---- jump
+
+    private fun showJumpDialog() {
+        val ownerAct = dialogOwner() ?: return
+        val total = MediaBus.total
+        if (total <= 0) {
+            toastShort("Load subtitles first")
+            return
+        }
+        holdPlayback()
+        val start = (flagCurIdx + 1).coerceIn(1, total)
+        val pair = stepperRow(ownerAct, start.toString(), 1.0, 1.0, total.toDouble(), false, false, "")
+        val holder = LinearLayout(ownerAct)
+        holder.setPadding(dp(24), dp(8), dp(24), 0)
+        holder.addView(pair.first, LinearLayout.LayoutParams(MATCH, WRAP))
+        val d = AlertDialog.Builder(ownerAct)
+            .setTitle("Jump to subtitle")
+            .setMessage("Type a number from 1 to " + total + " and the practice starts there.")
+            .setView(holder)
+            .setPositiveButton("Go", null)
+            .setNegativeButton("Cancel", null)
+            .setOnDismissListener { dialogClosed() }
+            .create()
+        d.setOnShowListener {
+            d.getButton(DialogInterface.BUTTON_POSITIVE).setOnClickListener {
+                val n = pair.second.text.toString().trim().toIntOrNull()
+                if (n == null || n < 1 || n > total) {
+                    toastShort("Enter a number from 1 to " + total)
+                } else {
+                    resumeAfterDialog = false      // the jump itself starts the playback
+                    page("cmd('jump:" + n + "')")
+                    d.dismiss()
+                }
+            }
+        }
+        d.show()
+    }
+
+    // ---- upload subtitles (main / translated)
+
+    private fun pickSubtitles(kind: String) {
+        val a = activityProvider() as? AppActivity
+        if (a == null || a.isFinishing) return
+        try {
+            val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
+            i.addCategory(Intent.CATEGORY_OPENABLE)
+            i.type = "*/*"      // .srt has no Android MIME type, so never filter
+            a.launchSubsPicker(i, kind)
+        } catch (e: Exception) {
+            toastShort("Could not open the file picker")
+        }
+    }
+
+    /** The learner picked a subtitle file: its bytes go to the page, which reads and loads it like its own upload button. */
+    fun onSubsPicked(kind: String, uri: Uri) {
+        if (released) return
+        val name = readInfo(uri).first
+        val appCtx = act.applicationContext
+        Thread {
+            val bytes: ByteArray? = try {
+                appCtx.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+            } catch (e: Throwable) {
+                null
+            }
+            main.post {
+                if (!released) {
+                    if (bytes == null || bytes.isEmpty()) {
+                        toastShort("Could not read that file")
+                    } else if (bytes.size > 12 * 1024 * 1024) {
+                        toastShort("That file is too big to be a subtitle file")
+                    } else {
+                        val b64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+                        page("loadSrt(" + JSONObject.quote(kind) + "," + JSONObject.quote(name) + "," + JSONObject.quote(b64) + ")")
+                    }
+                }
+            }
+        }.start()
+    }
+
+    // ---- words filter
+
+    private fun showWordsDialog() {
+        val ownerAct = dialogOwner() ?: return
+        main.removeCallbacks(hideRunnable)
+        val input = EditText(ownerAct)
+        input.inputType = InputType.TYPE_CLASS_TEXT
+        input.hint = "5 or 5-8"
+        input.setText(filterWords)
+        input.setSelection(input.text.length)
+        input.gravity = Gravity.CENTER
+        val holder = FrameLayout(ownerAct)
+        holder.setPadding(dp(24), dp(8), dp(24), 0)
+        holder.addView(input, FrameLayout.LayoutParams(MATCH, WRAP))
+        val d = AlertDialog.Builder(ownerAct)
+            .setTitle("Words")
+            .setMessage("Practice only subtitles with this many words.\n5 = five words or more, 5-8 = from five to eight words. Empty = every subtitle.")
+            .setView(holder)
+            .setPositiveButton("Set", null)
+            .setNeutralButton("Clear") { _, _ -> page("setWords('')") }
+            .setNegativeButton("Cancel", null)
+            .setOnDismissListener { poke() }
+            .create()
+        d.setOnShowListener {
+            d.getButton(DialogInterface.BUTTON_POSITIVE).setOnClickListener {
+                val v = input.text.toString().replace(" ", "")
+                if (v.isEmpty() || Regex("[0-9]+(-[0-9]+)?").matches(v)) {
+                    d.dismiss()
+                    page("setWords(" + JSONObject.quote(v) + ")")
+                } else {
+                    toastShort("Use a number like 5 or a range like 5-8")
+                }
+            }
+        }
+        d.show()
+    }
+
+    // ---- range (+ pinned ranges, hide range, delete range)
+
+    private fun showRangeDialog() {
+        val ownerAct = dialogOwner() ?: return
+        main.removeCallbacks(hideRunnable)
+        val input = EditText(ownerAct)
+        input.inputType = InputType.TYPE_CLASS_TEXT
+        input.hint = "e.g. 1-5"
+        input.setText(filterRange)
+        input.setSelection(input.text.length)
+        input.gravity = Gravity.CENTER
+        var dlg: AlertDialog? = null
+        fun valid(): String? {
+            val v = input.text.toString().replace(" ", "")
+            return if (Regex("[0-9]+(-[0-9]+)?").matches(v)) v else null
+        }
+        fun mk(label: String, onTap: () -> Unit): Button {
+            val b = Button(ownerAct)
+            b.text = label
+            b.isAllCaps = false
+            b.setOnClickListener { onTap() }
+            return b
+        }
+        val pinBtn = mk("Pin range") {
+            val v = valid()
+            if (v == null) {
+                toastShort("Enter a range like 1-5 first")
+            } else {
+                dlg?.dismiss()
+                page("rangeQuiet(" + JSONObject.quote(v) + ")")
+                page("rangePin()")
+            }
+        }
+        val pinnedBtn = mk("Pinned ranges") {
+            dlg?.dismiss()
+            page("listPinned()")
+        }
+        val hideBtn = mk("Hide / show range") {
+            val v = valid()
+            if (v == null) {
+                toastShort("Enter a range like 1-5 first")
+            } else {
+                dlg?.dismiss()
+                page("rangeQuiet(" + JSONObject.quote(v) + ")")
+                page("rangeHide()")
+            }
+        }
+        val deleteBtn = mk("Delete range") {
+            val v = valid()
+            if (v == null) {
+                toastShort("Enter a range like 1-5 first")
+            } else {
+                dlg?.dismiss()
+                page("rangeQuiet(" + JSONObject.quote(v) + ")")
+                page("rangeDelete()")
+            }
+        }
+        val rowA = LinearLayout(ownerAct)
+        rowA.orientation = LinearLayout.HORIZONTAL
+        rowA.addView(pinBtn, LinearLayout.LayoutParams(0, WRAP, 1f))
+        rowA.addView(pinnedBtn, LinearLayout.LayoutParams(0, WRAP, 1f))
+        val rowB = LinearLayout(ownerAct)
+        rowB.orientation = LinearLayout.HORIZONTAL
+        rowB.addView(hideBtn, LinearLayout.LayoutParams(0, WRAP, 1f))
+        rowB.addView(deleteBtn, LinearLayout.LayoutParams(0, WRAP, 1f))
+        val col = LinearLayout(ownerAct)
+        col.orientation = LinearLayout.VERTICAL
+        col.setPadding(dp(24), dp(8), dp(24), 0)
+        col.addView(input, LinearLayout.LayoutParams(MATCH, WRAP))
+        col.addView(rowA, LinearLayout.LayoutParams(MATCH, WRAP))
+        col.addView(rowB, LinearLayout.LayoutParams(MATCH, WRAP))
+        val scroll = ScrollView(ownerAct)
+        scroll.addView(col)
+        val d = AlertDialog.Builder(ownerAct)
+            .setTitle("Range")
+            .setMessage("Practice only these subtitle numbers, like 1-5. Empty = all.")
+            .setView(scroll)
+            .setPositiveButton("Apply", null)
+            .setNeutralButton("Clear") { _, _ -> page("setRange('')") }
+            .setNegativeButton("Close", null)
+            .setOnDismissListener { poke() }
+            .create()
+        dlg = d
+        d.setOnShowListener {
+            d.getButton(DialogInterface.BUTTON_POSITIVE).setOnClickListener {
+                val v = input.text.toString().replace(" ", "")
+                if (v.isEmpty() || Regex("[0-9]+(-[0-9]+)?").matches(v)) {
+                    d.dismiss()
+                    page("setRange(" + JSONObject.quote(v) + ")")
+                } else {
+                    toastShort("Use a range like 1-5")
+                }
+            }
+        }
+        d.show()
+    }
+
+    private fun showPinnedDialog(arr: JSONArray) {
+        val ownerAct = dialogOwner() ?: return
+        if (arr.length() == 0) {
+            toastShort("No pinned ranges yet. Type a range, then tap Pin range.")
+            return
+        }
+        val ranges = Array(arr.length()) { arr.optString(it, "") }
+        val labels = Array(arr.length()) { "Range " + ranges[it] }
+        main.removeCallbacks(hideRunnable)
+        val d = AlertDialog.Builder(ownerAct)
+            .setTitle("Pinned ranges (hold to remove)")
+            .setItems(labels) { _, which -> page("playPinned(" + JSONObject.quote(ranges[which]) + ")") }
+            .setNegativeButton("Close", null)
+            .setOnDismissListener { poke() }
+            .create()
+        d.setOnShowListener {
+            d.listView.setOnItemLongClickListener { _, _, pos, _ ->
+                page("unpin(" + JSONObject.quote(ranges[pos]) + ")")
+                d.dismiss()
+                main.postDelayed({ page("listPinned()") }, 250)
+                true
+            }
+        }
+        d.show()
+    }
+
+    // ---- starred subtitles
+
+    private fun showStarredDialog(arr: JSONArray) {
+        val ownerAct = dialogOwner() ?: return
+        if (arr.length() == 0) {
+            toastShort("No starred subtitles yet. Tap the star button to add one.")
+            return
+        }
+        val idx = IntArray(arr.length())
+        val labels = Array(arr.length()) { "" }
+        for (k in 0 until arr.length()) {
+            val pair = arr.getJSONArray(k)
+            idx[k] = pair.getInt(0)
+            labels[k] = (idx[k] + 1).toString() + ".  " + shorten(pair.getString(1))
+        }
+        main.removeCallbacks(hideRunnable)
+        val d = AlertDialog.Builder(ownerAct)
+            .setTitle("Starred (hold to remove)")
+            .setItems(labels) { _, which -> page("cmd('jump:" + (idx[which] + 1) + "')") }
+            .setNegativeButton("Close", null)
+            .setOnDismissListener { poke() }
+            .create()
+        d.setOnShowListener {
+            d.listView.setOnItemLongClickListener { _, _, pos, _ ->
+                page("unstar(" + idx[pos] + ")")
+                d.dismiss()
+                main.postDelayed({ page("listStarred()") }, 250)
+                true
+            }
+        }
+        d.show()
+    }
+
+    // ---- bulk delete
+
+    private fun showBulkDeleteDialog(arr: JSONArray) {
+        val ownerAct = dialogOwner() ?: return
+        val n = arr.length()
+        if (n == 0) {
+            toastShort("Load subtitles first")
+            return
+        }
+        val idx = IntArray(n)
+        val labels = Array(n) { "" }
+        val checked = BooleanArray(n)
+        for (k in 0 until n) {
+            val pair = arr.getJSONArray(k)
+            idx[k] = pair.getInt(0)
+            labels[k] = (idx[k] + 1).toString() + ".  " + shorten(pair.getString(1))
+        }
+        main.removeCallbacks(hideRunnable)
+        val d = AlertDialog.Builder(ownerAct)
+            .setTitle("Bulk delete")
+            .setMultiChoiceItems(labels, checked) { _, which, isChecked -> checked[which] = isChecked }
+            .setPositiveButton("Delete", null)
+            .setNeutralButton("Select all", null)
+            .setNegativeButton("Cancel", null)
+            .setOnDismissListener { poke() }
+            .create()
+        d.setOnShowListener {
+            d.getButton(DialogInterface.BUTTON_NEUTRAL).setOnClickListener {
+                val allOn = checked.any { !it }
+                val lv = d.listView
+                for (k in 0 until n) {
+                    checked[k] = allOn
+                    lv.setItemChecked(k, allOn)
+                }
+            }
+            d.getButton(DialogInterface.BUTTON_POSITIVE).setOnClickListener {
+                val sel = ArrayList<Int>()
+                for (k in 0 until n) {
+                    if (checked[k]) sel.add(idx[k])
+                }
+                if (sel.isEmpty()) {
+                    toastShort("Tick the subtitles to delete first")
+                } else {
+                    d.dismiss()
+                    page("bulkDelete(" + sel.joinToString(",", "[", "]") + ")")
+                }
+            }
+        }
+        d.show()
     }
 
     // ------------------------------------------------------------------ [FS_FLAGS] bookmark / favorite / repeat / delay
@@ -1172,6 +1908,24 @@ class NativeVideo(
             fsSub2.alpha = if (sub2Has) 0.35f else 0.18f
             fsSub2.clearColorFilter()
         }
+        // subtitles on / off: lit (orange) when the subtitles are switched off
+        fsSubsToggle.setImageResource(if (subsVisible) R.drawable.ic_subs_on else R.drawable.ic_subs_off)
+        if (subsVisible) {
+            fsSubsToggle.alpha = 0.35f
+            fsSubsToggle.clearColorFilter()
+        } else {
+            fsSubsToggle.alpha = 0.95f
+            fsSubsToggle.setColorFilter(Color.parseColor("#FF8A4C"))
+        }
+        // landscape / portrait: shows the mode the screen is in now, lit (orange) in portrait
+        fsOrient.setImageResource(if (fsPortrait) R.drawable.ic_orient_portrait else R.drawable.ic_orient_landscape)
+        if (fsPortrait) {
+            fsOrient.alpha = 0.95f
+            fsOrient.setColorFilter(Color.parseColor("#FF8A4C"))
+        } else {
+            fsOrient.alpha = 0.35f
+            fsOrient.clearColorFilter()
+        }
     }
 
     /** Sent by the page: text of the second subtitle for the sentence that is playing, whether it is turned on, whether one is loaded. */
@@ -1185,7 +1939,7 @@ class NativeVideo(
 
     private fun applySub2() {
         sub2Text.text = sub2Str
-        sub2Text.visibility = if (fullscreen && sub2On && sub2Has && sub2Str.isNotEmpty() && subtitleText.text.isNotEmpty()) View.VISIBLE else View.GONE
+        sub2Text.visibility = if (fullscreen && subsVisible && sub2On && sub2Has && sub2Str.isNotEmpty() && subtitleText.text.isNotEmpty()) View.VISIBLE else View.GONE
     }
 
     private fun fmtDelay(d: Double): String {
@@ -1193,19 +1947,21 @@ class NativeVideo(
         return if (r == Math.floor(r)) r.toInt().toString() else r.toString()
     }
 
-    /** Three dots menu (top right). Add new entries here with item(...). */
+    /** Three dots menu (top right). Add new entries here with item(...) (and header(...) for a new group). */
     private fun showMoreMenu() {
         main.removeCallbacks(hideRunnable)
         morePopup?.dismiss()
         val box = LinearLayout(act)
         box.orientation = LinearLayout.VERTICAL
-        box.minimumWidth = dp(230)
+        box.minimumWidth = dp(240)
+        box.setPadding(0, dp(6), 0, dp(6))
+        val scroll = ScrollView(act)
         val bg = GradientDrawable()
         bg.setColor(Color.parseColor("#F2202124"))
         bg.cornerRadius = dp(12).toFloat()
-        box.background = bg
-        box.setPadding(0, dp(6), 0, dp(6))
-        val pw = PopupWindow(box, ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, true)
+        scroll.background = bg
+        scroll.addView(box, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        val pw = PopupWindow(scroll, ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, true)
         pw.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
         pw.isOutsideTouchable = true
         pw.elevation = dp(8).toFloat()
@@ -1213,10 +1969,20 @@ class NativeVideo(
             morePopup = null
             poke()
         }
+        fun header(title: String) {
+            val h = TextView(act)
+            h.text = title
+            h.setTextColor(Color.argb(140, 255, 255, 255))
+            h.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            h.setTypeface(h.typeface, android.graphics.Typeface.BOLD)
+            h.letterSpacing = 0.08f
+            h.setPadding(dp(18), dp(12), dp(22), dp(2))
+            box.addView(h, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
         fun item(title: String, sub: String, onClick: () -> Unit) {
             val row = LinearLayout(act)
             row.orientation = LinearLayout.VERTICAL
-            row.setPadding(dp(18), dp(10), dp(22), dp(10))
+            row.setPadding(dp(18), dp(9), dp(22), dp(9))
             val t = TextView(act)
             t.text = title
             t.setTextColor(Color.WHITE)
@@ -1233,9 +1999,25 @@ class NativeVideo(
             }
             box.addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         }
-        // 1. delay sentence
+        // playback
         item("Delay sentence", "Pause between sentences: " + fmtDelay(flagDelay) + " s") { showDelayDialog() }
+        // subtitle files
+        header("SUBTITLE FILES")
+        item("Upload subtitles", "Choose the main .srt file") { pickSubtitles("main") }
+        item("Upload translated subtitles", "Choose a second .srt (shown under the main line)") { pickSubtitles("second") }
+        // what is practiced
+        header("PRACTICE FILTER")
+        item("Words", if (filterWords.isEmpty()) "Off: every subtitle" else "Only subtitles with " + filterWords + " words") { showWordsDialog() }
+        item("Range", if (filterRange.isEmpty()) "All subtitles" else "Subtitles " + filterRange) { showRangeDialog() }
+        // the subtitle list
+        header("SUBTITLE LIST")
+        item("Starred subtitles", "Jump to a favorite") { page("listStarred()") }
+        item("Bulk delete", "Pick many subtitles and delete them") { page("listSentences()") }
         morePopup = pw
+        // tall menu: never taller than the screen, scrolls inside
+        box.measure(View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED), View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED))
+        val maxH = (act.resources.displayMetrics.heightPixels - dp(72)).coerceAtLeast(dp(160))
+        pw.height = minOf(box.measuredHeight, maxH)
         pw.showAsDropDown(fsMore, 0, 0, Gravity.END)
     }
 
@@ -1385,7 +2167,12 @@ class NativeVideo(
     fun setSubtitle(text: String, playing: Boolean) {
         subtitleText.text = text
         fsPlay.setImageResource(if (playing) R.drawable.ic_pause else R.drawable.ic_play)
-        subtitleText.visibility = if (fullscreen && text.isNotEmpty()) View.VISIBLE else View.GONE
+        syncSubtitleViews()
+    }
+
+    /** Subtitle lines on the picture: shown only in full screen, only when there is text and the on / off toggle is on. */
+    private fun syncSubtitleViews() {
+        subtitleText.visibility = if (fullscreen && subsVisible && subtitleText.text.isNotEmpty()) View.VISIBLE else View.GONE
         applySub2()
     }
 
@@ -1413,6 +2200,15 @@ class NativeVideo(
         }
         fullscreen = on
         morePopup?.dismiss()
+        // always leave the lock, the brightness / volume read-out and any paused-for-dialog state behind
+        locked = false
+        main.removeCallbacks(unlockHide)
+        main.removeCallbacks(hudHide)
+        unlockBtn.visibility = View.GONE
+        hudBox.visibility = View.GONE
+        adjMode = 0
+        resumeAfterDialog = false
+        applyScreenBrightness(on)
         // always start and end full screen in the normal (linked, repeating) mode, with the controls hidden
         if (unlinked) {
             unlinked = false
@@ -1427,7 +2223,7 @@ class NativeVideo(
         main.removeCallbacks(uiTick)
         main.removeCallbacks(hideRunnable)
         playerView.useController = ctlWanted && !on
-        activityProvider()?.requestedOrientation = if (on) ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE else ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        activityProvider()?.requestedOrientation = if (on) fsOrientation() else ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         relayout()
         notifyFullscreen(on)
     }
@@ -1435,7 +2231,8 @@ class NativeVideo(
     /** The screen was recreated (rotation lock, Recents, ...) while full screen: put the orientation back and tell the page again. */
     fun reapplyFullscreen() {
         if (!fullscreen) return
-        activityProvider()?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        activityProvider()?.requestedOrientation = fsOrientation()
+        applyScreenBrightness(true)
         relayout()
         notifyFullscreen(true)
     }
@@ -1446,6 +2243,10 @@ class NativeVideo(
 
     /** Back button: leaves full screen first. Returns true when it was used. */
     fun handleBack(): Boolean {
+        if (fullscreen && locked) {
+            toastShort("Screen is locked. Tap the screen, then the lock button, to unlock.")
+            return true
+        }
         if (fullscreen) {
             setFullscreen(false)
             return true
