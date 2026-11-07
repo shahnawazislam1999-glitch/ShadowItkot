@@ -11,9 +11,14 @@ Standalone Android app (Kotlin + WebView). Opens straight into **SHADOWit**, no 
 
 ## Full screen video controls
 
-- By default only the picture and the subtitle show. Tap the screen: the position bar (just above the subtitle), the volume bar (top left) and the buttons appear, and hide again about 2 seconds after your last touch.
-- Position bar: slide with your finger, the picture follows. Volume bar: phone media volume.
-- Right-edge buttons: Previous, Play/Pause, Next, **Unlink** (film plays normally from first to last, no sentence repeat; tap again to go back to repeating) and **Hide subtitle** (hides this sentence and moves on).
+- By default only the picture and the subtitle show. Gestures on the picture:
+  - **Single tap, middle** of the screen: play / pause.
+  - **Single tap, right side** (right 30%): next sentence. **Single tap, left side** (left 30%): previous sentence.
+  - **Double tap**: the position bar (at the very bottom, below the subtitle), the button strip and the 3-dot button (top right) appear and stay until you double tap again.
+  - **Press and slide left / right**: the video moves backward / forward (a finger across the whole screen = 2 minutes; change `FS_SWIPE_FULL_WIDTH_MS` in `NativeVideo.kt`). When you let go, the sentence player continues from that place.
+- Position bar: slide with your finger, the picture follows. (The volume bar was removed; use the phone's volume keys.)
+- Button strip (top right, slides sideways, 5 icons visible at a time): Previous, Play/Pause, Next, **Unlink** (film plays normally, no sentence repeat; tap again to go back), **Hide subtitle**, then slide for: **Bookmark** this subtitle, **Audio track**, **Repeat** (how many times every sentence repeats, or this sentence only; the number on the icon is the current count) **Favorite** (star) and **Second subtitle** on / off (translated SRT; the line shows right below the main subtitle).
+- **3-dot button** (top right) opens a menu: **Delay sentence** = pause between sentences in seconds (the same setting as Delay in the page).
 - Full screen always starts in normal repeat mode with the controls hidden.
 
 ## Background play

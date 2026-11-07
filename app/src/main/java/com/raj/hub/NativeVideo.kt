@@ -8,6 +8,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.Paint
 import android.graphics.RenderEffect
@@ -17,17 +18,24 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
-import android.media.AudioManager
 import android.os.ParcelFileDescriptor
 import android.os.StatFs
 import android.provider.OpenableColumns
+import android.text.InputType
 import android.text.TextPaint
+import android.view.GestureDetector
 import android.view.Gravity
 import android.view.LayoutInflater
+import android.view.MotionEvent
 import android.view.TextureView
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.ViewGroup
+import android.widget.Button
+import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
+import android.widget.PopupWindow
 import android.widget.LinearLayout
 import android.widget.ImageView
 import android.widget.TextView
@@ -78,6 +86,18 @@ import java.util.Locale
  *  - The page keeps using its normal <video> calls; a small script in the page forwards them to [cmd]
  *    and receives player state back through window.__nvOn(...).
  */
+/** Full screen gestures: width of the left and the right tap zone (fraction of the screen width). The rest is the middle. */
+private const val FS_SIDE_ZONE = 0.30f
+
+/** Full screen gestures: sliding a finger across the whole screen width moves the video by this much. */
+private const val FS_SWIPE_FULL_WIDTH_MS = 120_000L
+
+/** Full screen button strip: how many icons are visible at once (the others are reached by sliding the strip sideways). */
+private const val FS_STRIP_VISIBLE = 5
+
+/** Full screen button strip: size of one icon cell in dp. */
+private const val FS_ITEM_DP = 46
+
 @androidx.annotation.OptIn(UnstableApi::class)
 class NativeVideo(
     private val ctx: Context,
@@ -115,21 +135,50 @@ class NativeVideo(
 
     // full screen: clean picture with the subtitle drawn on it + three dim buttons (previous / play-pause / next)
     private val subtitleText = TextView(act)
+    // [FS_STRIP] horizontal scrolling strip (top right): prev, play, next, unlink, hide | bookmark, audio, repeat, favorite
+    private val fsStrip = HorizontalScrollView(act)
     private val fsControls = LinearLayout(act)
     private val fsPrev = ImageView(act)
     private val fsPlay = ImageView(act)
     private val fsNext = ImageView(act)
     private val fsUnlink = ImageView(act)
     private val fsHide = ImageView(act)
+    private val fsBookmark = ImageView(act)
+    private val fsAudio = ImageView(act)
+    private val fsRepeatWrap = FrameLayout(act)
+    private val fsRepeat = ImageView(act)
+    private val fsRepeatBadge = TextView(act)
+    private val fsStar = ImageView(act)
+    // [FS_SUB2] second subtitle (translated SRT): toggle button in the strip + a line below the main subtitle
+    private val fsSub2 = ImageView(act)
+    private val subBox = LinearLayout(act)
+    private val sub2Text = TextView(act)
+    private var sub2Str = ""
+    private var sub2On = false
+    private var sub2Has = false
+    // [FS_MORE] three dots (top right) -> small menu (Delay sentence)
+    private val fsMore = ImageView(act)
+    private var morePopup: PopupWindow? = null
+
+    // state of the current sentence, sent by the page (see setFlags)
+    private var flagStar = false
+    private var flagBookmark = false
+    private var flagCustomRepeat = 0      // repeat count set for this sentence only (0 = none)
+    private var flagGlobalRepeat = 0      // repeat count for every sentence
+    private var flagDelay = 0.0           // pause between sentences, seconds
+    private var flagCurIdx = -1           // page's index (0 based) of the current sentence
 
     // full screen: everything except picture + subtitle stays hidden until the screen is tapped, then hides again by itself
     private val tapLayer = View(act)
     private val seekBar = FsSlider(act)
-    private val volBar = FsSlider(act)
-    private val audioMgr = act.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private var unlinked = false          // "free play": the page stops repeating sentences, the film just plays
     private var fsUiVisible = false
+    private var uiPinned = false          // double tap: controls stay on screen until the next double tap
     private var scrubbing = false
+    private var swiping = false           // finger is down and sliding left / right on the picture
+    private var swipeStartMs = 0L
+    private var swipeTargetMs = 0L
+    private val seekHint = TextView(act)
     private var lastScrubAt = 0L
     private var audioChipWanted = false
     private var ctlWanted = true
@@ -169,8 +218,20 @@ class NativeVideo(
         panel.addView(tiles, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         // invisible layer that catches the "tap to show the controls" touch while full screen
         tapLayer.visibility = View.GONE
-        tapLayer.setOnClickListener { onFsTap() }
+        setupFsGestures()
         panel.addView(tapLayer, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        // small time read-out in the middle while sliding (touches pass through)
+        seekHint.setTextColor(Color.WHITE)
+        seekHint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
+        seekHint.setTypeface(seekHint.typeface, android.graphics.Typeface.BOLD)
+        seekHint.gravity = Gravity.CENTER
+        seekHint.setPadding(dp(18), dp(8), dp(18), dp(8))
+        seekHint.background = GradientDrawable().apply {
+            setColor(Color.argb(150, 0, 0, 0))
+            cornerRadius = dp(14).toFloat()
+        }
+        seekHint.visibility = View.GONE
+        panel.addView(seekHint, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
         // only a small speaker icon, very faint (10% opacity) so it does not distract from the picture
         audioChip.setImageResource(R.drawable.ic_audio_track)
         audioChip.alpha = 0.10f
@@ -189,11 +250,25 @@ class NativeVideo(
         subtitleText.setShadowLayer(7f, 0f, 1.5f, Color.BLACK)
         subtitleText.setLineSpacing(0f, 1.05f)
         subtitleText.visibility = View.GONE
-        panel.addView(subtitleText, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL))
+        // [FS_SUB2] second subtitle line, drawn right below the main subtitle
+        sub2Text.setTextColor(Color.parseColor("#BDE7FF"))
+        sub2Text.setTypeface(sub2Text.typeface, android.graphics.Typeface.BOLD)
+        sub2Text.gravity = Gravity.CENTER
+        sub2Text.setShadowLayer(7f, 0f, 1.5f, Color.BLACK)
+        sub2Text.setLineSpacing(0f, 1.05f)
+        sub2Text.visibility = View.GONE
+        subBox.orientation = LinearLayout.VERTICAL
+        subBox.gravity = Gravity.CENTER_HORIZONTAL
+        subBox.addView(subtitleText, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        subBox.addView(sub2Text, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        panel.addView(subBox, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL))
 
-        // three very dim buttons, middle of the right edge
-        fsControls.orientation = LinearLayout.VERTICAL
-        fsControls.visibility = View.GONE
+        // [FS_STRIP] very dim buttons in a horizontal strip (top right, left of the three dots).
+        // Only FS_STRIP_VISIBLE icons fit; slide the strip sideways to reach the rest.
+        fsControls.orientation = LinearLayout.HORIZONTAL
+        fsStrip.visibility = View.GONE
+        fsStrip.isHorizontalScrollBarEnabled = false
+        fsStrip.overScrollMode = View.OVER_SCROLL_NEVER
         fsPrev.setImageResource(R.drawable.ic_prev)
         fsPlay.setImageResource(R.drawable.ic_play)
         fsNext.setImageResource(R.drawable.ic_next)
@@ -204,21 +279,79 @@ class NativeVideo(
         fsHide.setImageResource(R.drawable.ic_eye_off)
         fsUnlink.contentDescription = "Unlink subtitles: play the film normally"
         fsHide.contentDescription = "Hide this subtitle"
-        for (b in listOf(fsPrev, fsPlay, fsNext, fsUnlink, fsHide)) {
+        fsBookmark.setImageResource(R.drawable.ic_bookmark_border)
+        fsAudio.setImageResource(R.drawable.ic_audio_track)
+        fsRepeat.setImageResource(R.drawable.ic_repeat)
+        fsStar.setImageResource(R.drawable.ic_star_border)
+        fsSub2.setImageResource(R.drawable.ic_translate)
+        fsMore.setImageResource(R.drawable.ic_more_vert)
+        fsBookmark.contentDescription = "Bookmark this subtitle"
+        fsAudio.contentDescription = "Audio track"
+        fsRepeatWrap.contentDescription = "How many times each sentence repeats"
+        fsStar.contentDescription = "Add this subtitle to favorites"
+        fsSub2.contentDescription = "Second subtitle on / off"
+        fsMore.contentDescription = "More"
+        for (b in listOf(fsPrev, fsPlay, fsNext, fsUnlink, fsHide, fsBookmark, fsAudio, fsRepeat, fsStar, fsSub2, fsMore)) {
             b.alpha = 0.35f
             b.setPadding(dp(11), dp(11), dp(11), dp(11))
-            fsControls.addView(b, LinearLayout.LayoutParams(dp(50), dp(50)))
         }
+        // repeat icon with a small number in the corner (how many times each sentence repeats)
+        fsRepeatBadge.setTextColor(Color.WHITE)
+        fsRepeatBadge.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+        fsRepeatBadge.setTypeface(fsRepeatBadge.typeface, android.graphics.Typeface.BOLD)
+        fsRepeatBadge.setShadowLayer(3f, 0f, 1f, Color.BLACK)
+        fsRepeatBadge.alpha = 0.75f
+        fsRepeatBadge.visibility = View.GONE
+        fsRepeatWrap.addView(fsRepeat, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        val badgeLp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.END)
+        badgeLp.setMargins(0, 0, dp(5), dp(4))
+        fsRepeatWrap.addView(fsRepeatBadge, badgeLp)
+        val itemPx = dp(FS_ITEM_DP)
+        for (v in listOf<View>(fsPrev, fsPlay, fsNext, fsUnlink, fsHide, fsBookmark, fsAudio, fsRepeatWrap, fsStar, fsSub2)) {
+            fsControls.addView(v, LinearLayout.LayoutParams(itemPx, itemPx))
+        }
+        fsStrip.addView(fsControls, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         fsPrev.setOnClickListener { evalJs("window.__rajMedia&&window.__rajMedia.cmd('prev')"); poke() }
         fsPlay.setOnClickListener { evalJs("window.__rajMedia&&window.__rajMedia.cmd('toggle')"); poke() }
         fsNext.setOnClickListener { evalJs("window.__rajMedia&&window.__rajMedia.cmd('next')"); poke() }
         fsUnlink.setOnClickListener { setUnlinked(!unlinked); poke() }
         fsHide.setOnClickListener { evalJs("window.__rajMedia&&window.__rajMedia.cmd('hide')"); poke() }
-        val ctlLp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.END or Gravity.CENTER_VERTICAL)
-        ctlLp.setMargins(0, 0, dp(10), 0)
-        panel.addView(fsControls, ctlLp)
+        fsBookmark.setOnClickListener { evalJs("window.__rajMedia&&window.__rajMedia.cmd('bookmark')"); poke() }
+        fsStar.setOnClickListener { evalJs("window.__rajMedia&&window.__rajMedia.cmd('star')"); poke() }
+        fsAudio.setOnClickListener {
+            if (audioList.size >= 2) {
+                main.removeCallbacks(hideRunnable)
+                showAudioDialog()
+            } else {
+                Toast.makeText(act.applicationContext, "This video has only one audio track", Toast.LENGTH_SHORT).show()
+                poke()
+            }
+        }
+        fsSub2.setOnClickListener {
+            if (!sub2Has) {
+                Toast.makeText(act.applicationContext, "Upload a second subtitle (SRT) in the page first", Toast.LENGTH_SHORT).show()
+            } else {
+                evalJs("window.__rajMedia&&window.__rajMedia.cmd('sub2')")
+            }
+            poke()
+        }
+        fsRepeatWrap.setOnClickListener { showRepeatDialog() }
+        fsMore.setOnClickListener { showMoreMenu() }
+        // keep the controls up while the finger is on the strip (sliding it sideways)
+        fsStrip.setOnTouchListener { _, e ->
+            if (e.actionMasked == MotionEvent.ACTION_DOWN) main.removeCallbacks(hideRunnable)
+            if (e.actionMasked == MotionEvent.ACTION_UP || e.actionMasked == MotionEvent.ACTION_CANCEL) poke()
+            false
+        }
+        val stripLp = FrameLayout.LayoutParams(itemPx * FS_STRIP_VISIBLE, itemPx, Gravity.TOP or Gravity.END)
+        stripLp.setMargins(0, dp(4), dp(6) + itemPx, 0)
+        panel.addView(fsStrip, stripLp)
+        val moreLp = FrameLayout.LayoutParams(itemPx, itemPx, Gravity.TOP or Gravity.END)
+        moreLp.setMargins(0, dp(4), dp(6), 0)
+        fsMore.visibility = View.GONE
+        panel.addView(fsMore, moreLp)
 
-        // position bar (sits on the line just above the subtitle) and volume bar (top left)
+        // [FS_SEEKBAR] position bar (bottom of the screen, below the subtitle)
         seekBar.contentDescription = "Video position"
         seekBar.visibility = View.GONE
         seekBar.onStart = {
@@ -252,12 +385,6 @@ class NativeVideo(
         }
         panel.addView(seekBar, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52), Gravity.BOTTOM))
 
-        volBar.contentDescription = "Volume"
-        volBar.visibility = View.GONE
-        volBar.onStart = { main.removeCallbacks(hideRunnable) }
-        volBar.onChange = { f -> setSysVolume(f) }
-        volBar.onEnd = { _ -> poke() }
-        panel.addView(volBar, FrameLayout.LayoutParams(dp(240), dp(48), Gravity.TOP or Gravity.START))
         playerView.setFullscreenButtonClickListener { setFullscreen(!fullscreen) }
         playerView.subtitleView?.visibility = View.GONE
     }
@@ -775,27 +902,146 @@ class NativeVideo(
         val dm = act.resources.displayMetrics
         val shortSide = minOf(dm.widthPixels, dm.heightPixels)
         subtitleText.setTextSize(TypedValue.COMPLEX_UNIT_PX, shortSide * 0.055f)
-        val lp = subtitleText.layoutParams as FrameLayout.LayoutParams
+        sub2Text.setTextSize(TypedValue.COMPLEX_UNIT_PX, shortSide * 0.045f)
+        val lp = subBox.layoutParams as FrameLayout.LayoutParams
         val side = maxOf(dp(24), (maxOf(dm.widthPixels, dm.heightPixels) * 0.12f).toInt())
-        lp.setMargins(side, 0, side, (shortSide * 0.09f).toInt())
-        subtitleText.layoutParams = lp
+        // subtitle sits above the position bar, which is at the very bottom
+        lp.setMargins(side, 0, side, dp(38) + (shortSide * 0.03f).toInt())
+        subBox.layoutParams = lp
+        applySub2()
         subtitleText.visibility = if (fullscreen && subtitleText.text.isNotEmpty()) View.VISIBLE else View.GONE
-        // position bar on the line just above the subtitle (about a quarter of the screen height from the bottom)
+        // position bar at the bottom edge, below the subtitle (full width: the button strip is at the top now)
         val slp = seekBar.layoutParams as FrameLayout.LayoutParams
-        slp.setMargins(dp(14), 0, dp(80), maxOf(0, (shortSide * 0.26f).toInt() - dp(26)))
+        slp.setMargins(dp(14), 0, dp(14), dp(6))
         seekBar.layoutParams = slp
-        val vlp = volBar.layoutParams as FrameLayout.LayoutParams
-        vlp.setMargins(dp(14), dp(8), 0, 0)
-        volBar.layoutParams = vlp
         fsPlay.setImageResource(if (MediaBus.playing) R.drawable.ic_pause else R.drawable.ic_play)
         applyFsUi()
     }
 
     // ------------------------------------------------------------------ full screen: hidden controls, tap to show
 
-    private fun onFsTap() {
+    /**
+     * Full screen touch gestures (all on the picture; the buttons and bars sit above this layer and keep working as before):
+     *  - single tap in the middle  = play / pause
+     *  - single tap on the right   = next sentence
+     *  - single tap on the left    = previous sentence
+     *  - double tap                = show all controls and keep them; double tap again = hide them
+     *  - press and slide left / right = move the video backward / forward (the page's sentence player follows when you let go)
+     */
+    @Suppress("ClickableViewAccessibility")
+    private fun setupFsGestures() {
+        val slop = ViewConfiguration.get(act).scaledTouchSlop
+        val longPressMs = ViewConfiguration.getLongPressTimeout().toLong()
+        var downAt = 0L
+        var upAt = 0L
+        val detector = GestureDetector(act, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDown(e: MotionEvent): Boolean = true
+
+            override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+                // a long press that ends without sliding is not a tap
+                if (upAt - downAt > longPressMs) return false
+                onFsSingleTap(e.x)
+                return true
+            }
+
+            override fun onDoubleTap(e: MotionEvent): Boolean {
+                onFsDoubleTap()
+                return true
+            }
+
+            override fun onScroll(e1: MotionEvent?, e2: MotionEvent, distanceX: Float, distanceY: Float): Boolean {
+                if (e1 == null || !fullscreen) return false
+                val dx = e2.x - e1.x
+                val dy = e2.y - e1.y
+                if (!swiping) {
+                    // start only for a clearly horizontal slide, so a shaky tap is never taken for a slide
+                    if (Math.abs(dx) < slop * 2 || Math.abs(dx) < Math.abs(dy) * 1.2f) return false
+                    startSwipe()
+                }
+                updateSwipe(dx)
+                return true
+            }
+        })
+        // press-and-hold must still allow sliding, so the detector's own long-press mode is off
+        detector.setIsLongpressEnabled(false)
+        tapLayer.setOnTouchListener { _, e ->
+            if (e.actionMasked == MotionEvent.ACTION_DOWN) downAt = e.eventTime
+            if (e.actionMasked == MotionEvent.ACTION_UP) upAt = e.eventTime
+            detector.onTouchEvent(e)
+            if (e.actionMasked == MotionEvent.ACTION_UP || e.actionMasked == MotionEvent.ACTION_CANCEL) {
+                if (swiping) endSwipe()
+            }
+            true
+        }
+    }
+
+    private fun onFsSingleTap(x: Float) {
         if (!fullscreen) return
-        if (fsUiVisible) hideFsUi() else showFsUi()
+        val w = tapLayer.width.toFloat().coerceAtLeast(1f)
+        val cmd = when {
+            x < w * FS_SIDE_ZONE -> "prev"
+            x > w * (1f - FS_SIDE_ZONE) -> "next"
+            else -> "toggle"
+        }
+        evalJs("window.__rajMedia&&window.__rajMedia.cmd('$cmd')")
+        poke()
+    }
+
+    private fun onFsDoubleTap() {
+        if (!fullscreen) return
+        if (uiPinned) {
+            uiPinned = false
+            hideFsUi()
+        } else {
+            uiPinned = true
+            showFsUi()
+        }
+    }
+
+    private fun startSwipe() {
+        val p = exo ?: return
+        swiping = true
+        scrubbing = true
+        swipeStartMs = p.currentPosition.coerceAtLeast(0L)
+        swipeTargetMs = swipeStartMs
+        main.removeCallbacks(hideRunnable)
+        evalJs("window.__rajMedia&&window.__rajMedia.scrubStart()")
+        seekHint.visibility = View.VISIBLE
+    }
+
+    private fun updateSwipe(dx: Float) {
+        val p = exo ?: return
+        val w = tapLayer.width.toFloat().coerceAtLeast(1f)
+        val dur = p.duration
+        var target = swipeStartMs + (dx / w * FS_SWIPE_FULL_WIDTH_MS).toLong()
+        target = target.coerceAtLeast(0L)
+        if (dur != C.TIME_UNSET && dur > 100L && target >= dur) target = dur - 50L
+        swipeTargetMs = target
+        val delta = (target - swipeStartMs) / 1000L
+        seekHint.text = (if (delta >= 0) "+" else "-") + fmtMs(Math.abs(delta) * 1000L) + "   " + fmtMs(target)
+        if (dur != C.TIME_UNSET && dur > 0L) {
+            seekBar.setFraction(target.toFloat() / dur.toFloat())
+            seekBar.setLabels(fmtMs(target), fmtMs(dur))
+        }
+        val now = SystemClock.uptimeMillis()
+        if (now - lastScrubAt > 90L) {
+            lastScrubAt = now
+            liveSeek(target)
+        }
+    }
+
+    private fun endSwipe() {
+        swiping = false
+        scrubbing = false
+        seekHint.visibility = View.GONE
+        val dur = exo?.duration ?: C.TIME_UNSET
+        if (dur != C.TIME_UNSET && dur > 0L) {
+            liveSeek(swipeTargetMs)
+            evalJs("window.__rajMedia&&window.__rajMedia.scrubEnd(" + swipeTargetMs + ")")
+        } else {
+            evalJs("window.__rajMedia&&window.__rajMedia.scrubEnd(-1)")
+        }
+        poke()
     }
 
     private fun showFsUi() {
@@ -811,14 +1057,15 @@ class NativeVideo(
     /** Any touch on a control: keep the controls up for two more seconds. */
     private fun poke() {
         main.removeCallbacks(hideRunnable)
-        if (fsUiVisible) main.postDelayed(hideRunnable, 2000)
+        if (fsUiVisible && !uiPinned) main.postDelayed(hideRunnable, 2000)
     }
 
     private fun hideFsUi() {
-        if (scrubbing || seekBar.dragging || volBar.dragging) {
+        if (scrubbing || seekBar.dragging) {
             poke()
             return
         }
+        if (uiPinned) return     // pinned by a double tap: only another double tap hides it
         fsUiVisible = false
         main.removeCallbacks(uiTick)
         main.removeCallbacks(hideRunnable)
@@ -854,20 +1101,17 @@ class NativeVideo(
     private fun applyFsUi() {
         val show = fullscreen && fsUiVisible
         tapLayer.visibility = if (fullscreen) View.VISIBLE else View.GONE
-        fade(fsControls, show)
+        fade(fsStrip, show)
+        fade(fsMore, show)
         fade(seekBar, show)
-        fade(volBar, show)
-        if (!audioChipWanted) {
+        // the faint speaker chip is only for the normal (not full screen) player; full screen has the audio button in the strip
+        if (!audioChipWanted || fullscreen) {
             audioChip.visibility = View.GONE
-        } else if (!fullscreen) {
+        } else {
             audioChip.alpha = 0.10f
             audioChip.visibility = View.VISIBLE
-        } else if (show) {
-            audioChip.alpha = 0.45f
-            audioChip.visibility = View.VISIBLE
-        } else {
-            audioChip.visibility = View.INVISIBLE
         }
+        updateFlagUi()
     }
 
     private fun refreshSliders() {
@@ -880,27 +1124,232 @@ class NativeVideo(
                 seekBar.setLabels(fmtMs(pos), fmtMs(dur))
             }
         }
-        if (!volBar.dragging) {
-            try {
-                val max = audioMgr.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
-                val cur = audioMgr.getStreamVolume(AudioManager.STREAM_MUSIC)
-                volBar.setFraction(cur.toFloat() / max)
-                volBar.setLabels("Volume " + (cur * 100 / max) + "%", "")
-            } catch (e: Exception) {
-                // volume bar is optional
-            }
+    }
+
+    // ------------------------------------------------------------------ [FS_FLAGS] bookmark / favorite / repeat / delay
+
+    /** Sent by the page: star + bookmark state of the current sentence, repeat counts, delay (seconds), current sentence index. */
+    fun setFlags(starred: Boolean, bookmarked: Boolean, customRepeat: Int, globalRepeat: Int, delaySec: Double, curIndex: Int) {
+        flagStar = starred
+        flagBookmark = bookmarked
+        flagCustomRepeat = customRepeat
+        flagGlobalRepeat = globalRepeat
+        flagDelay = delaySec
+        flagCurIdx = curIndex
+        updateFlagUi()
+    }
+
+    private fun updateFlagUi() {
+        fsBookmark.setImageResource(if (flagBookmark) R.drawable.ic_bookmark else R.drawable.ic_bookmark_border)
+        if (flagBookmark) {
+            fsBookmark.alpha = 0.95f
+            fsBookmark.setColorFilter(Color.parseColor("#6EC1FF"))
+        } else {
+            fsBookmark.alpha = 0.35f
+            fsBookmark.clearColorFilter()
+        }
+        fsStar.setImageResource(if (flagStar) R.drawable.ic_star else R.drawable.ic_star_border)
+        if (flagStar) {
+            fsStar.alpha = 0.95f
+            fsStar.setColorFilter(Color.parseColor("#FFD54A"))
+        } else {
+            fsStar.alpha = 0.35f
+            fsStar.clearColorFilter()
+        }
+        val eff = if (flagCustomRepeat > 0) flagCustomRepeat else flagGlobalRepeat
+        if (eff > 0) {
+            fsRepeatBadge.text = eff.toString()
+            fsRepeatBadge.setTextColor(if (flagCustomRepeat > 0) Color.parseColor("#FF8A4C") else Color.WHITE)
+            fsRepeatBadge.visibility = View.VISIBLE
+        } else {
+            fsRepeatBadge.visibility = View.GONE
+        }
+        fsAudio.alpha = if (audioList.size >= 2) 0.35f else 0.18f
+        if (sub2Has && sub2On) {
+            fsSub2.alpha = 0.95f
+            fsSub2.setColorFilter(Color.parseColor("#7CE38B"))
+        } else {
+            fsSub2.alpha = if (sub2Has) 0.35f else 0.18f
+            fsSub2.clearColorFilter()
         }
     }
 
-    private fun setSysVolume(f: Float) {
-        try {
-            val max = audioMgr.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
-            val v = Math.round(f * max).coerceIn(0, max)
-            audioMgr.setStreamVolume(AudioManager.STREAM_MUSIC, v, 0)
-            volBar.setLabels("Volume " + (v * 100 / max) + "%", "")
-        } catch (e: Exception) {
-            // some phones refuse in Do Not Disturb; the hardware keys still work
+    /** Sent by the page: text of the second subtitle for the sentence that is playing, whether it is turned on, whether one is loaded. */
+    fun setSub2(text: String, on: Boolean, has: Boolean) {
+        sub2Str = text
+        sub2On = on
+        sub2Has = has
+        applySub2()
+        updateFlagUi()
+    }
+
+    private fun applySub2() {
+        sub2Text.text = sub2Str
+        sub2Text.visibility = if (fullscreen && sub2On && sub2Has && sub2Str.isNotEmpty() && subtitleText.text.isNotEmpty()) View.VISIBLE else View.GONE
+    }
+
+    private fun fmtDelay(d: Double): String {
+        val r = Math.round(d * 10.0) / 10.0
+        return if (r == Math.floor(r)) r.toInt().toString() else r.toString()
+    }
+
+    /** Three dots menu (top right). Add new entries here with item(...). */
+    private fun showMoreMenu() {
+        main.removeCallbacks(hideRunnable)
+        morePopup?.dismiss()
+        val box = LinearLayout(act)
+        box.orientation = LinearLayout.VERTICAL
+        box.minimumWidth = dp(230)
+        val bg = GradientDrawable()
+        bg.setColor(Color.parseColor("#F2202124"))
+        bg.cornerRadius = dp(12).toFloat()
+        box.background = bg
+        box.setPadding(0, dp(6), 0, dp(6))
+        val pw = PopupWindow(box, ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, true)
+        pw.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        pw.isOutsideTouchable = true
+        pw.elevation = dp(8).toFloat()
+        pw.setOnDismissListener {
+            morePopup = null
+            poke()
         }
+        fun item(title: String, sub: String, onClick: () -> Unit) {
+            val row = LinearLayout(act)
+            row.orientation = LinearLayout.VERTICAL
+            row.setPadding(dp(18), dp(10), dp(22), dp(10))
+            val t = TextView(act)
+            t.text = title
+            t.setTextColor(Color.WHITE)
+            t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            val u = TextView(act)
+            u.text = sub
+            u.setTextColor(Color.argb(170, 255, 255, 255))
+            u.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            row.addView(t)
+            row.addView(u)
+            row.setOnClickListener {
+                pw.dismiss()
+                onClick()
+            }
+            box.addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+        // 1. delay sentence
+        item("Delay sentence", "Pause between sentences: " + fmtDelay(flagDelay) + " s") { showDelayDialog() }
+        morePopup = pw
+        pw.showAsDropDown(fsMore, 0, 0, Gravity.END)
+    }
+
+    /** [-] number [+] row. allowEmpty: going below [min] clears the field (empty = "not set"). */
+    private fun stepperRow(c: Context, initial: String, step: Double, min: Double, max: Double,
+                           decimal: Boolean, allowEmpty: Boolean, hint: String): Pair<LinearLayout, EditText> {
+        val row = LinearLayout(c)
+        row.orientation = LinearLayout.HORIZONTAL
+        row.gravity = Gravity.CENTER_VERTICAL
+        val edit = EditText(c)
+        edit.inputType = if (decimal) (InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL) else InputType.TYPE_CLASS_NUMBER
+        edit.setText(initial)
+        edit.hint = hint
+        edit.gravity = Gravity.CENTER
+        edit.setSelectAllOnFocus(true)
+        val minus = Button(c)
+        minus.text = "\u2212"
+        val plus = Button(c)
+        plus.text = "+"
+        fun cur(): Double? = edit.text.toString().trim().replace(',', '.').toDoubleOrNull()
+        fun setNum(v: Double) {
+            edit.setText(if (decimal) fmtDelay(v) else v.toInt().toString())
+        }
+        minus.setOnClickListener {
+            val v = cur()
+            if (v == null) {
+                if (!allowEmpty) setNum(min)
+            } else if (allowEmpty && v - step < min) {
+                edit.setText("")
+            } else {
+                setNum((v - step).coerceAtLeast(min))
+            }
+        }
+        plus.setOnClickListener {
+            val v = cur()
+            setNum(if (v == null) min else (v + step).coerceAtMost(max))
+        }
+        row.addView(minus, LinearLayout.LayoutParams(dp(56), ViewGroup.LayoutParams.WRAP_CONTENT))
+        row.addView(edit, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        row.addView(plus, LinearLayout.LayoutParams(dp(56), ViewGroup.LayoutParams.WRAP_CONTENT))
+        return Pair(row, edit)
+    }
+
+    /** Delay sentence: the page's pause between sentences, in seconds. */
+    private fun showDelayDialog() {
+        val ownerAct = activityProvider() ?: return
+        if (ownerAct.isFinishing) return
+        main.removeCallbacks(hideRunnable)
+        val pair = stepperRow(ownerAct, fmtDelay(flagDelay), 0.5, 0.0, 60.0, true, false, "0")
+        val holder = LinearLayout(ownerAct)
+        holder.setPadding(dp(24), dp(8), dp(24), 0)
+        holder.addView(pair.first, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        AlertDialog.Builder(ownerAct)
+            .setTitle("Delay sentence")
+            .setMessage("Pause after each sentence before the next one starts, in seconds. 0 = no pause.")
+            .setView(holder)
+            .setPositiveButton("Set") { _, _ ->
+                val v = pair.second.text.toString().trim().replace(',', '.').toDoubleOrNull()
+                if (v != null && v >= 0.0) {
+                    val clean = fmtDelay(v.coerceAtMost(60.0))
+                    evalJs("window.__rajMedia&&window.__rajMedia.cmd('delay:" + clean + "')")
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .setOnDismissListener { poke() }
+            .show()
+    }
+
+    /** Repeat: how many times every sentence repeats, and (optionally) a different count for this sentence only. */
+    private fun showRepeatDialog() {
+        val ownerAct = activityProvider() ?: return
+        if (ownerAct.isFinishing) return
+        main.removeCallbacks(hideRunnable)
+        // the film keeps playing under the dialog, so remember which sentence this is for
+        val targetIdx = flagCurIdx
+        val startAll = flagGlobalRepeat
+        val startOne = flagCustomRepeat
+        val allPair = stepperRow(ownerAct, if (startAll > 0) startAll.toString() else "1", 1.0, 1.0, 100.0, false, false, "")
+        val onePair = stepperRow(ownerAct, if (startOne > 0) startOne.toString() else "", 1.0, 1.0, 100.0, false, true, "same")
+        val col = LinearLayout(ownerAct)
+        col.orientation = LinearLayout.VERTICAL
+        col.setPadding(dp(24), dp(8), dp(24), 0)
+        fun label(t: String): TextView {
+            val tv = TextView(ownerAct)
+            tv.text = t
+            tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            tv.setPadding(0, dp(8), 0, dp(2))
+            return tv
+        }
+        val full = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        col.addView(label("Every sentence repeats (times)"))
+        col.addView(allPair.first, full)
+        if (targetIdx >= 0) {
+            col.addView(label("This sentence only (empty = same as above)"))
+            col.addView(onePair.first, full)
+        }
+        AlertDialog.Builder(ownerAct)
+            .setTitle("Repeat")
+            .setView(col)
+            .setPositiveButton("Set") { _, _ ->
+                val all = allPair.second.text.toString().trim().toIntOrNull()
+                if (all != null && all >= 1 && all != startAll) {
+                    evalJs("window.__rajMedia&&window.__rajMedia.cmd('repeatAll:" + all.coerceAtMost(100) + "')")
+                }
+                if (targetIdx >= 0) {
+                    val one = (onePair.second.text.toString().trim().toIntOrNull() ?: 0).coerceIn(0, 100)
+                    if (one != startOne) {
+                        evalJs("window.__rajMedia&&window.__rajMedia.cmd('repeatOne:" + targetIdx + ":" + one + "')")
+                    }
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .setOnDismissListener { poke() }
+            .show()
     }
 
     /** Moves the picture while the finger slides on the position bar (the page's sentence player is paused meanwhile). */
@@ -937,6 +1386,7 @@ class NativeVideo(
         subtitleText.text = text
         fsPlay.setImageResource(if (playing) R.drawable.ic_pause else R.drawable.ic_play)
         subtitleText.visibility = if (fullscreen && text.isNotEmpty()) View.VISIBLE else View.GONE
+        applySub2()
     }
 
     private fun applyVisibility() {
@@ -962,6 +1412,7 @@ class NativeVideo(
             return
         }
         fullscreen = on
+        morePopup?.dismiss()
         // always start and end full screen in the normal (linked, repeating) mode, with the controls hidden
         if (unlinked) {
             unlinked = false
@@ -969,6 +1420,9 @@ class NativeVideo(
         }
         updateUnlinkUi()
         fsUiVisible = false
+        uiPinned = false
+        swiping = false
+        seekHint.visibility = View.GONE
         scrubbing = false
         main.removeCallbacks(uiTick)
         main.removeCallbacks(hideRunnable)

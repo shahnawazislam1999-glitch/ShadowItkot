@@ -146,6 +146,14 @@ class WebHost private constructor(val appCtx: Context, val app: AppInfo) {
   var free = false, freeIdx = -2, freeTimer = null, sc = null;
 
   function vpl() { try { return videoPlayer; } catch (e) { return null; } }
+  function byId(i) { return document.getElementById(i); }
+  // sets a page input the same way typing would (the page saves it and reacts to the 'input' event)
+  function setInput(id, v) {
+    var el = byId(id);
+    if (!el) return;
+    el.value = String(v);
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+  }
   function cleanLine(t) { return String(t || '').replace(/\s+/g, ' ').trim(); }
 
   // index of the subtitle showing at raw video time t (seconds), or -1 in a gap
@@ -313,7 +321,93 @@ class WebHost private constructor(val appCtx: Context, val app: AppInfo) {
     setTimeout(snap, 500);
   }
 
+  // [FS_FLAGS] bookmark / favorite state of the current sentence, repeat counts and delay -> full screen buttons
+  var lastFlags = '';
+  function flags() {
+    try {
+      if (typeof B.mediaFlags !== 'function') return;
+      if (typeof sentences === 'undefined' || !sentences || !sentences.length) return;
+      var ix = (typeof sentenceIndex === 'number') ? sentenceIndex : -1;
+      var s = (ix >= 0 && ix < sentences.length) ? sentences[ix] : null;
+      var st = (s !== null) && starredSentences.has(s);
+      var bm = (s !== null) && bookmarkedSentences.has(s);
+      var cr = (s !== null && customRepeats[s]) ? (parseInt(customRepeats[s], 10) || 0) : 0;
+      var gr = parseInt(byId('sentenceRepeatInput').value, 10) || 1;
+      var dl = parseFloat(byId('delayInput').value);
+      if (!isFinite(dl) || dl < 0) dl = 0;
+      var k = [st, bm, cr, gr, dl, ix].join('|');
+      if (k === lastFlags) return;
+      lastFlags = k;
+      B.mediaFlags(st, bm, cr, gr, dl, ix);
+    } catch (e) {}
+  }
+
+  // bookmark button: same as the page's bookmark button, but it always toggles (the page's own button opens the list while playing)
+  function toggleBookmark() {
+    try {
+      if (!sentences || !sentences.length || sentenceIndex < 0 || sentenceIndex >= sentences.length) return;
+      var s = sentences[sentenceIndex];
+      if (bookmarkedSentences.has(s)) bookmarkedSentences.delete(s); else bookmarkedSentences.add(s);
+      localStorage.setItem('app_bookmarks', JSON.stringify(Array.from(bookmarkedSentences)));
+      try { updateActiveSentenceToolbar(); } catch (e) {}
+    } catch (e) {}
+  }
+
+  // settings commands from the full screen menu / repeat dialog: delay:<sec>  repeatAll:<n>  repeatOne:<sentenceIndex>:<n>
+  function setting(c) {
+    try {
+      if (c.indexOf('delay:') === 0) {
+        var d = parseFloat(c.slice(6));
+        if (isFinite(d) && d >= 0) setInput('delayInput', Math.min(d, 60));
+      } else if (c.indexOf('repeatAll:') === 0) {
+        var n = parseInt(c.slice(10), 10);
+        if (n >= 1) setInput('sentenceRepeatInput', Math.min(n, 100));
+      } else if (c.indexOf('repeatOne:') === 0) {
+        var parts = c.slice(10).split(':');
+        var ix = parseInt(parts[0], 10), cnt = parseInt(parts[1], 10);
+        if (!(ix >= 0) || !sentences || ix >= sentences.length) return;
+        var sen = sentences[ix];
+        if (cnt > 0) customRepeats[sen] = Math.min(cnt, 100); else delete customRepeats[sen];
+        localStorage.setItem('app_custom_repeats', JSON.stringify(customRepeats));
+        try { updateActiveSentenceToolbar(); } catch (e) {}
+        try { if (!isPlaying) updateScreenOnly(); } catch (e) {}
+      }
+    } catch (e) {}
+    setTimeout(snap, 60);
+  }
+
+  // [FS_SUB2] second subtitle (translated SRT) text for the sentence(s) playing now -> shown below the main subtitle in full screen
+  var lastSub2 = '';
+  function plain(t) { return String(t || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim(); }
+  function sub2(mainText, gs, ge) {
+    try {
+      if (typeof B.mediaSub2 !== 'function' || typeof secondSrtSubtitles === 'undefined') return;
+      var has = !!(secondSrtSubtitles && secondSrtSubtitles.length);
+      var on = has && !!showSecondSrtCurrentLine;
+      var out = '';
+      if (on && mainText) {
+        var used = {}, parts = [];
+        if (free) {
+          var v = vpl(), f = v ? findSecondSrtAtTime(getSubtitleMatchingTime(v.currentTime)) : null;
+          var fx = f ? f.index : ((freeIdx >= 0) ? findSecondSrtIndexForPrimaryIndex(freeIdx) : -1);
+          if (fx >= 0 && secondSrtSubtitles[fx]) parts.push(plain(secondSrtSubtitles[fx].text));
+        } else {
+          for (var i = gs; i <= ge; i++) {
+            var x = findSecondSrtIndexForPrimaryIndex(i);
+            if (x >= 0 && !used[x] && secondSrtSubtitles[x]) { used[x] = 1; parts.push(plain(secondSrtSubtitles[x].text)); }
+          }
+        }
+        out = parts.join(' ').trim();
+      }
+      var k = out + '|' + on + '|' + has;
+      if (k === lastSub2) return;
+      lastSub2 = k;
+      B.mediaSub2(out, on, has);
+    } catch (e) {}
+  }
+
   function snap() {
+    flags();
     try {
       var total = 0, idx = 0, text = '', pl = false;
       if (free && typeof sentences !== 'undefined' && sentences && sentences.length) {
@@ -339,6 +433,7 @@ class WebHost private constructor(val appCtx: Context, val app: AppInfo) {
         }
         text = parts.join(' ');
       }
+      sub2(text, (typeof gs === 'number') ? gs : Math.max(0, idx - 1), (typeof ge === 'number') ? ge : Math.max(0, idx - 1));
       var key = text + '|' + idx + '|' + total + '|' + pl;
       if (key === last) return;
       last = key;
@@ -350,6 +445,19 @@ class WebHost private constructor(val appCtx: Context, val app: AppInfo) {
     try {
       if (c === 'unlink:1') { enterFree(); return; }
       if (c === 'unlink:0') { exitFree(); return; }
+      // these work the same in normal and free play
+      if (c === 'bookmark') { toggleBookmark(); setTimeout(snap, 60); return; }
+      if (c === 'sub2') {
+        if (secondSrtSubtitles && secondSrtSubtitles.length) {
+          showSecondSrtCurrentLine = !showSecondSrtCurrentLine;
+          localStorage.setItem('app_show_second_srt', String(showSecondSrtCurrentLine));
+          try { updateSecondSrtButtonStates(); } catch (e) {}
+          try { updateScreenOnly(); } catch (e) {}
+        }
+        setTimeout(snap, 60); return;
+      }
+      if (c === 'star') { var sb = byId('actStarBtn'); if (sb) sb.click(); setTimeout(snap, 60); return; }
+      if (c.indexOf('delay:') === 0 || c.indexOf('repeatAll:') === 0 || c.indexOf('repeatOne:') === 0) { setting(c); return; }
       if (free) {
         if (c === 'toggle') freeToggle();
         else if (c === 'hide') freeHide();
@@ -977,6 +1085,21 @@ class WebHost private constructor(val appCtx: Context, val app: AppInfo) {
                 nv.setSubtitle(MediaBus.text, MediaBus.playing)
                 PlaybackService.refreshNow()
             }
+        }
+
+        /** Star / bookmark state of the current sentence + repeat counts + delay, for the full screen buttons. */
+        @JavascriptInterface
+        fun mediaFlags(starred: Boolean, bookmarked: Boolean, customRepeat: Double, globalRepeat: Double, delaySec: Double, curIndex: Double) {
+            main.post {
+                if (destroyed) return@post
+                nv.setFlags(starred, bookmarked, customRepeat.toInt(), globalRepeat.toInt(), delaySec, curIndex.toInt())
+            }
+        }
+
+        /** Second subtitle (translated SRT) line for the sentence playing now, plus on / loaded state, for the full screen view. */
+        @JavascriptInterface
+        fun mediaSub2(text: String?, on: Boolean, has: Boolean) {
+            main.post { if (!destroyed) nv.setSub2(text ?: "", on, has) }
         }
 
         @JavascriptInterface
